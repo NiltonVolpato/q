@@ -6,7 +6,9 @@ use crossterm::{
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
-    layout::Position,
+    layout::{Constraint, Flex, Layout, Position},
+    style::Style,
+    text::Line,
 };
 use ratatui_code_editor::editor::Editor;
 use ratatui_code_editor::theme::vesper;
@@ -35,13 +37,19 @@ fn main() {
 }"#;
 
     let mut editor = Editor::new("rust", content, vesper())?;
+    let status_bar = Line::from("Press Esc to exit").style(Style::new().dim());
     let mut editor_area = ratatui::layout::Rect::default();
 
     loop {
         terminal.draw(|frame| {
             let area = frame.area();
-            editor_area = area;
+            let [top, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
+                .flex(Flex::End)
+                .areas(area);
+            editor_area = top;
+
             frame.render_widget(&editor, editor_area);
+            frame.render_widget(&status_bar, bottom);
 
             if let Some((x, y)) = editor.get_visible_cursor(&editor_area) {
                 frame.set_cursor_position(Position::new(x, y));
