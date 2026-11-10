@@ -5,7 +5,7 @@ use karet_theme::Theme;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -41,9 +41,10 @@ impl<'a> StatusBar<'a> {
 
         // Left hints or discard confirmation prompt
         let left = if config.in_confirm_discard {
+            let warning_color = theme.role(ThemeRole::DiagnosticWarning).to_ratatui();
             Line::from(vec![Span::styled(
                 "Discard unsaved changes? (y/n)",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default().fg(warning_color).add_modifier(Modifier::BOLD),
             )])
         } else {
             let left_text = match config.mode {
