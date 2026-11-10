@@ -44,6 +44,7 @@ fn main() {
 }"#;
 
     let mut editor = Editor::new("rust", content, vesper())?;
+    editor.set_left_code_padding(1);
     let status_bar = Line::from("Press Esc to exit").style(Style::new().dim());
     let mut viewport_area = ratatui::layout::Rect::default();
     let mut editor_area = ratatui::layout::Rect::default();
