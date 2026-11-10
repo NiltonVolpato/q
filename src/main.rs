@@ -3,11 +3,13 @@ mod status_bar;
 
 use std::collections::BTreeSet;
 use std::io::{Stdout, stdout};
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEvent,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseButton,
+        MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
@@ -15,18 +17,78 @@ use crossterm::{
 use karet_core::{FoldRegions, Highlights, LineCol, Range};
 use karet_editor::{Editor, EditorState, Fold, editing, resolve_folds};
 use karet_syntax::Highlighter;
-use karet_text::TextBuffer;
+use karet_text::{Encoding, Eol, TextBuffer};
 use karet_theme::Theme;
 use karet_treesitter::{
-    LanguageId, ParserPool, SyntaxTree, language_id_from_injection_name,
+    LanguageId, ParserPool, SyntaxTree, language_id_from_path, language_name_from_path,
 };
-use keymap::{Action, map_key};
+use keymap::{Action, EditorMode, map_key};
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
     layout::{Constraint, Flex, Layout, Position, Rect},
 };
 use status_bar::{StatusBar, StatusBarConfig};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CliArgs {
+    pub mode: EditorMode,
+    pub file_path: PathBuf,
+}
+
+/// Parse CLI arguments.
+///
+/// # Errors
+/// Returns an error if an unknown option is provided, if multiple files are provided,
+/// or if the required `<FILE>` argument is missing.
+fn parse_args<I, T>(args: I) -> anyhow::Result<Option<CliArgs>>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<String>,
+{
+    let mut args_iter = args.into_iter().map(Into::into);
+    let _program_name = args_iter.next();
+
+    let mut mode = EditorMode::Normal;
+    let mut file_path: Option<PathBuf> = None;
+
+    for arg in args_iter {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "qe - inline terminal editor\n\n\
+                     Usage: qe [OPTIONS] <FILE>\n\n\
+                     Arguments:\n  \
+                       <FILE>  Path to file to edit or create\n\n\
+                     Options:\n  \
+                       -p, --prompt  Prompt mode (Enter accepts, Shift+Enter newline, Esc aborts)\n  \
+                       -h, --help    Print help"
+                );
+                return Ok(None);
+            }
+            "-p" | "--prompt" => {
+                mode = EditorMode::Prompt;
+            }
+            arg if arg.starts_with('-') => {
+                anyhow::bail!("unknown option '{arg}'. Use --help for usage information.");
+            }
+            _ => {
+                if file_path.is_some() {
+                    anyhow::bail!(
+                        "unexpected argument '{arg}'. Exactly one file argument is expected."
+                    );
+                }
+                file_path = Some(PathBuf::from(arg));
+            }
+        }
+    }
+
+    let file_path = file_path.ok_or_else(|| {
+        anyhow::anyhow!("missing required <FILE> argument. Usage: qe [OPTIONS] <FILE>")
+    })?;
+
+    Ok(Some(CliArgs { mode, file_path }))
+}
 
 struct SyntaxHighlighter {
     pool: ParserPool,
@@ -35,8 +97,7 @@ struct SyntaxHighlighter {
 }
 
 impl SyntaxHighlighter {
-    fn new(lang_label: &str) -> Option<Self> {
-        let lang = language_id_from_injection_name(lang_label)?;
+    fn new(lang: LanguageId) -> Option<Self> {
         let highlighter = Highlighter::new(lang).ok()?;
         Some(Self {
             pool: ParserPool::new(),
@@ -56,36 +117,83 @@ impl SyntaxHighlighter {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardStage {
+    RawMode,
+    MouseCapture,
+    FullyInitialized,
+    Restored,
+}
+
+struct TerminalGuard {
+    terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
+    viewport_area: Option<Rect>,
+    stage: GuardStage,
+}
+
+impl TerminalGuard {
+    fn init(lines: u16) -> anyhow::Result<Self> {
+        enable_raw_mode()?;
+        let mut guard = Self {
+            terminal: None,
+            viewport_area: None,
+            stage: GuardStage::RawMode,
+        };
+        execute!(stdout(), EnableMouseCapture)?;
+        guard.stage = GuardStage::MouseCapture;
+        let backend = CrosstermBackend::new(stdout());
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(lines),
+            },
+        )?;
+        guard.terminal = Some(terminal);
+        guard.stage = GuardStage::FullyInitialized;
+        Ok(guard)
+    }
+
+    const fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+        self.terminal.as_mut().expect("terminal initialized")
+    }
+
+    const fn set_viewport_area(&mut self, area: Rect) {
+        self.viewport_area = Some(area);
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.stage == GuardStage::Restored {
+            return;
+        }
+        if self.stage == GuardStage::FullyInitialized
+            && let Some(terminal) = self.terminal.as_mut()
+        {
+            let _ = terminal.clear();
+            if let Some(area) = self.viewport_area {
+                let _ = terminal.set_cursor_position(Position::new(area.x, area.y));
+            }
+            let _ = terminal.show_cursor();
+        }
+        if matches!(
+            self.stage,
+            GuardStage::MouseCapture | GuardStage::FullyInitialized
+        ) {
+            let _ = execute!(stdout(), DisableMouseCapture);
+        }
+        if self.stage != GuardStage::Restored {
+            let _ = disable_raw_mode();
+        }
+        self.stage = GuardStage::Restored;
+    }
+}
+
 fn split_viewport(area: Rect) -> (Rect, Rect) {
     let [top, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
         .flex(Flex::End)
         .areas(area);
     [top, bottom].into()
-}
-
-fn init_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
-    enable_raw_mode()?;
-    execute!(stdout(), EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout());
-    let terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(10),
-        },
-    )?;
-    Ok(terminal)
-}
-
-fn restore_terminal(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    viewport_area: Rect,
-) -> anyhow::Result<()> {
-    terminal.clear()?;
-    terminal.set_cursor_position(Position::new(viewport_area.x, viewport_area.y))?;
-    terminal.show_cursor()?;
-    execute!(stdout(), DisableMouseCapture)?;
-    disable_raw_mode()?;
-    Ok(())
 }
 
 fn toggle_comment_on_current_line(
@@ -336,35 +444,34 @@ fn handle_action(
     state: &mut EditorState,
     folds: &FoldRegions,
     folded: &mut BTreeSet<u32>,
-) -> anyhow::Result<(bool, bool)> {
+) -> anyhow::Result<bool> {
     if handle_motion_action(action, buffer, state) {
-        return Ok((false, false));
+        return Ok(false);
     }
     if handle_edit_action(action, buffer, state)? {
-        return Ok((true, false));
+        return Ok(true);
     }
 
     match action {
-        Action::Quit => Ok((false, true)),
         Action::Undo => {
             if let Some(applied) = buffer.undo() {
                 if let Some(cursor) = applied.restored_cursor {
                     state.set_cursor_state(buffer, cursor);
                 }
-                Ok((true, false))
+                Ok(true)
             } else {
-                Ok((false, false))
+                Ok(false)
             }
         }
         Action::ToggleFold => {
             toggle_fold_at_cursor(folds, folded, state, buffer);
-            Ok((false, false))
+            Ok(false)
         }
         Action::ToggleComment => {
             toggle_comment_on_current_line(buffer, state)?;
-            Ok((true, false))
+            Ok(true)
         }
-        _ => Ok((false, false)),
+        _ => Ok(false),
     }
 }
 
@@ -409,21 +516,161 @@ fn handle_mouse_event(
     }
 }
 
-fn run_editor_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<Rect> {
-    let content = r#"// 10-line inline editor inside shell
-// Press Esc to exit
-fn main() {
-    let message = "Terminal scrollback preserved!";
-    println!("{}", message);
-    for index in 0..10 {
-        println!("Line {}", index);
-    }
-}"#;
+enum LoopControl {
+    Continue { text_changed: bool },
+    Exit(ExitCode),
+}
 
-    let mut buffer = TextBuffer::from_text(content);
+fn handle_key_press(
+    key: KeyEvent,
+    in_confirm_discard: &mut bool,
+    cli_args: &CliArgs,
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    folds: &FoldRegions,
+    folded: &mut BTreeSet<u32>,
+) -> anyhow::Result<LoopControl> {
+    if *in_confirm_discard {
+        return Ok(match key.code {
+            KeyCode::Char('y' | 'Y') => LoopControl::Exit(ExitCode::from(1)),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                *in_confirm_discard = false;
+                LoopControl::Continue {
+                    text_changed: false,
+                }
+            }
+            _ => LoopControl::Continue {
+                text_changed: false,
+            },
+        });
+    }
+
+    let action = map_key(key, cli_args.mode);
+    match action {
+        Action::Abort => {
+            if buffer.is_dirty() {
+                *in_confirm_discard = true;
+                Ok(LoopControl::Continue {
+                    text_changed: false,
+                })
+            } else {
+                Ok(LoopControl::Exit(ExitCode::from(1)))
+            }
+        }
+        Action::Quit => {
+            if buffer.is_dirty() {
+                *in_confirm_discard = true;
+                Ok(LoopControl::Continue {
+                    text_changed: false,
+                })
+            } else {
+                Ok(LoopControl::Exit(ExitCode::SUCCESS))
+            }
+        }
+        Action::Save => {
+            buffer
+                .save(&cli_args.file_path)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(LoopControl::Continue {
+                text_changed: false,
+            })
+        }
+        Action::SaveAndAccept => {
+            buffer
+                .save(&cli_args.file_path)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(LoopControl::Exit(ExitCode::SUCCESS))
+        }
+        other => {
+            let changed = handle_action(other, buffer, state, folds, folded)?;
+            Ok(LoopControl::Continue {
+                text_changed: changed,
+            })
+        }
+    }
+}
+
+struct RenderContext<'a> {
+    buffer: &'a TextBuffer,
+    theme: &'a Theme,
+    resolved_folds: &'a [Fold],
+    highlights: Option<&'a Highlights>,
+    lang_name: &'a str,
+    file_name: &'a str,
+    mode: EditorMode,
+    in_confirm_discard: bool,
+}
+
+fn render_editor(
+    frame: &mut ratatui::Frame,
+    ctx: &RenderContext,
+    state: &mut EditorState,
+) -> (Rect, Rect) {
+    let area = frame.area();
+    let (top, bottom) = split_viewport(area);
+
+    let mut editor_widget = Editor::new(ctx.buffer)
+        .theme(ctx.theme)
+        .folds(ctx.resolved_folds)
+        .focused(true);
+    if let Some(h) = ctx.highlights {
+        editor_widget = editor_widget.highlights(h);
+    }
+
+    frame.render_stateful_widget(editor_widget, top, state);
+
+    let eol_str = match ctx.buffer.eol() {
+        Eol::Lf => "LF",
+        Eol::Crlf => "CRLF",
+    };
+    let encoding_str = match ctx.buffer.encoding() {
+        Encoding::Utf8 => "UTF-8",
+        Encoding::Utf8Bom => "UTF-8 BOM",
+    };
+
+    let status_config = StatusBarConfig {
+        cursor: state.cursor(),
+        selection: state.selection_range(),
+        language: ctx.lang_name,
+        encoding: encoding_str,
+        eol: eol_str,
+        file_name: ctx.file_name,
+        is_dirty: ctx.buffer.is_dirty(),
+        mode: ctx.mode,
+        in_confirm_discard: ctx.in_confirm_discard,
+    };
+    StatusBar::new(ctx.theme, &status_config).draw(frame, bottom);
+
+    if let Some((x, y)) = state.primary_caret_cell(top, ctx.buffer, ctx.resolved_folds) {
+        frame.set_cursor_position(Position::new(x, y));
+    }
+
+    (area, top)
+}
+
+fn run_editor_loop(
+    guard: &mut TerminalGuard,
+    cli_args: &CliArgs,
+) -> anyhow::Result<ExitCode> {
+    let mut buffer = if cli_args.file_path.exists() {
+        TextBuffer::load(&cli_args.file_path).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        TextBuffer::from_text("")
+    };
+
+    let file_name = cli_args
+        .file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("untitled")
+        .to_owned();
+
+    let lang_id = language_id_from_path(&cli_args.file_path);
+    let lang_name = language_name_from_path(&cli_args.file_path).unwrap_or("Plain Text");
+    let mut syntax_highlighter = lang_id.and_then(SyntaxHighlighter::new);
+
     let mut state = EditorState::new();
     let theme = Theme::dark();
-    let mut syntax_highlighter = SyntaxHighlighter::new("rust");
     let (mut highlights, mut folds) = syntax_highlighter
         .as_mut()
         .map_or_else(|| (None, FoldRegions::default()), |sh| sh.analyze(&buffer.text()));
@@ -431,59 +678,52 @@ fn main() {
     let mut folded: BTreeSet<u32> = BTreeSet::new();
     let mut viewport_area = Rect::default();
     let mut editor_area = Rect::default();
+    let mut in_confirm_discard = false;
 
     loop {
         let resolved_folds = resolve_folds(&folds, &folded);
 
-        terminal.draw(|frame| {
-            let area = frame.area();
-            viewport_area = area;
-            let (top, bottom) = split_viewport(area);
-            editor_area = top;
+        let render_ctx = RenderContext {
+            buffer: &buffer,
+            theme: &theme,
+            resolved_folds: &resolved_folds,
+            highlights: highlights.as_ref(),
+            lang_name,
+            file_name: &file_name,
+            mode: cli_args.mode,
+            in_confirm_discard,
+        };
 
-            let mut editor_widget = Editor::new(&buffer)
-                .theme(&theme)
-                .folds(&resolved_folds)
-                .focused(true);
-            if let Some(ref h) = highlights {
-                editor_widget = editor_widget.highlights(h);
-            }
-
-            frame.render_stateful_widget(editor_widget, editor_area, &mut state);
-
-            let status_config = StatusBarConfig {
-                cursor: state.cursor(),
-                selection: state.selection_range(),
-                language: "Rust",
-                encoding: "UTF-8",
-                eol: "LF",
-            };
-            StatusBar::new(&theme, &status_config).draw(frame, bottom);
-
-            if let Some((x, y)) = state.primary_caret_cell(editor_area, &buffer, &resolved_folds) {
-                frame.set_cursor_position(Position::new(x, y));
-            }
+        guard.terminal_mut().draw(|frame| {
+            let (view_area, ed_area) = render_editor(frame, &render_ctx, &mut state);
+            viewport_area = view_area;
+            editor_area = ed_area;
         })?;
+        guard.set_viewport_area(viewport_area);
 
         if event::poll(std::time::Duration::from_millis(100))? {
             let mut text_changed = false;
 
             match event::read()? {
                 Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
-                    let action = map_key(key);
-                    let (changed, should_exit) = handle_action(
-                        action,
+                    match handle_key_press(
+                        key,
+                        &mut in_confirm_discard,
+                        cli_args,
                         &mut buffer,
                         &mut state,
                         &folds,
                         &mut folded,
-                    )?;
-                    if should_exit {
-                        break;
+                    )? {
+                        LoopControl::Continue {
+                            text_changed: changed,
+                        } => {
+                            text_changed = changed;
+                        }
+                        LoopControl::Exit(code) => return Ok(code),
                     }
-                    text_changed = changed;
                 }
-                Event::Mouse(mouse) => {
+                Event::Mouse(mouse) if !in_confirm_discard => {
                     handle_mouse_event(
                         mouse,
                         &buffer,
@@ -505,15 +745,31 @@ fn main() {
             }
         }
     }
-
-    Ok(viewport_area)
 }
 
-fn main() -> anyhow::Result<()> {
-    let mut terminal = init_terminal()?;
-    let viewport_area = run_editor_loop(&mut terminal)?;
-    restore_terminal(&mut terminal, viewport_area)?;
-    Ok(())
+fn run() -> anyhow::Result<ExitCode> {
+    let args = std::env::args();
+    let Some(cli_args) = parse_args(args)? else {
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    if cli_args.file_path.is_dir() {
+        anyhow::bail!("{}: Is a directory", cli_args.file_path.display());
+    }
+
+    let mut guard = TerminalGuard::init(10)?;
+    let exit_code = run_editor_loop(&mut guard, &cli_args)?;
+    Ok(exit_code)
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -545,8 +801,7 @@ mod tests {
         let folds = FoldRegions::default();
         let mut folded = BTreeSet::new();
 
-        // Move right without extend
-        let (changed, exit) = handle_action(
+        let changed = handle_action(
             Action::MoveRight { extend: false },
             &mut buffer,
             &mut state,
@@ -556,7 +811,6 @@ mod tests {
         .unwrap();
 
         assert!(!changed);
-        assert!(!exit);
         assert_eq!(state.cursor(), LineCol::new(0, 1));
         let sel = state.selection_range();
         assert!(sel.is_none() || sel.unwrap().start == sel.unwrap().end);
@@ -569,7 +823,6 @@ mod tests {
         let folds = FoldRegions::default();
         let mut folded = BTreeSet::new();
 
-        // Move right with extend = true
         handle_action(
             Action::MoveRight { extend: true },
             &mut buffer,
@@ -611,5 +864,203 @@ mod tests {
         )
         .unwrap();
         assert_eq!(buffer.text(), "fn test() {}");
+    }
+
+    #[test]
+    fn test_parse_args_normal_mode() {
+        let args = vec!["qe", "src/main.rs"];
+        let parsed = parse_args(args).unwrap().unwrap();
+        assert_eq!(parsed.mode, EditorMode::Normal);
+        assert_eq!(parsed.file_path, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn test_parse_args_prompt_mode() {
+        let args = vec!["qe", "-p", "commit.txt"];
+        let parsed = parse_args(args).unwrap().unwrap();
+        assert_eq!(parsed.mode, EditorMode::Prompt);
+        assert_eq!(parsed.file_path, PathBuf::from("commit.txt"));
+
+        let args_long = vec!["qe", "--prompt", "commit.txt"];
+        let parsed_long = parse_args(args_long).unwrap().unwrap();
+        assert_eq!(parsed_long.mode, EditorMode::Prompt);
+        assert_eq!(parsed_long.file_path, PathBuf::from("commit.txt"));
+    }
+
+    #[test]
+    fn test_parse_args_help() {
+        let args = vec!["qe", "--help"];
+        let parsed = parse_args(args).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_parse_args_missing_file_fails() {
+        let args = vec!["qe"];
+        assert!(parse_args(args).is_err());
+
+        let args_p = vec!["qe", "-p"];
+        assert!(parse_args(args_p).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_unknown_flag_fails() {
+        let args = vec!["qe", "--unknown", "file.txt"];
+        assert!(parse_args(args).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_multiple_files_fails() {
+        let args = vec!["qe", "file1.txt", "file2.txt"];
+        assert!(parse_args(args).is_err());
+    }
+
+    #[test]
+    fn test_new_file_save_and_dirty_lifecycle() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!(
+            "qe_test_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let mut buffer = TextBuffer::from_text("");
+        assert!(!buffer.is_dirty());
+
+        let edit = editing::insert(LineCol::new(0, 0), None, buffer.version(), "hello world");
+        buffer.apply_simple(&edit.change).unwrap();
+        assert!(buffer.is_dirty());
+
+        buffer.save(&temp_file).unwrap();
+        assert!(!buffer.is_dirty());
+
+        let content = std::fs::read_to_string(&temp_file).unwrap();
+        assert_eq!(content.trim(), "hello world");
+
+        let _ = std::fs::remove_file(temp_file);
+    }
+
+    #[test]
+    fn test_handle_key_press_abort_and_confirm_discard_flow() {
+        let cli_args = CliArgs {
+            mode: EditorMode::Normal,
+            file_path: PathBuf::from("test.txt"),
+        };
+        let mut buffer = TextBuffer::from_text("clean text");
+        let mut state = EditorState::new();
+        let folds = FoldRegions::default();
+        let mut folded = BTreeSet::new();
+        let mut in_confirm_discard = false;
+
+        // Clean Esc: exits immediately with code 1
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+            &mut in_confirm_discard,
+            &cli_args,
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+        assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
+        assert!(!in_confirm_discard);
+
+        // Edit buffer -> dirty
+        let edit = editing::insert(LineCol::new(0, 0), None, buffer.version(), "dirty ");
+        buffer.apply_simple(&edit.change).unwrap();
+        assert!(buffer.is_dirty());
+
+        // Dirty Esc: enters confirmation mode
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+            &mut in_confirm_discard,
+            &cli_args,
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+        assert!(matches!(res, LoopControl::Continue { text_changed: false }));
+        assert!(in_confirm_discard);
+
+        // While in confirm discard, pressing 'n' cancels confirmation
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE),
+            &mut in_confirm_discard,
+            &cli_args,
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+        assert!(matches!(res, LoopControl::Continue { text_changed: false }));
+        assert!(!in_confirm_discard);
+
+        // Dirty Esc again -> confirm discard
+        handle_key_press(
+            KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+            &mut in_confirm_discard,
+            &cli_args,
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+        assert!(in_confirm_discard);
+
+        // Pressing 'y' confirms discard and exits with code 1
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Char('y'), crossterm::event::KeyModifiers::NONE),
+            &mut in_confirm_discard,
+            &cli_args,
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+        assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
+    }
+
+    #[test]
+    fn test_handle_key_press_prompt_mode_accept() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!(
+            "qe_prompt_test_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cli_args = CliArgs {
+            mode: EditorMode::Prompt,
+            file_path: temp_file.clone(),
+        };
+        let mut buffer = TextBuffer::from_text("commit message");
+        let mut state = EditorState::new();
+        let folds = FoldRegions::default();
+        let mut folded = BTreeSet::new();
+        let mut in_confirm_discard = false;
+
+        // In prompt mode, Enter saves and accepts with code 0
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+            &mut in_confirm_discard,
+            &cli_args,
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+        assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::SUCCESS));
+        assert!(temp_file.exists());
+        let _ = std::fs::remove_file(temp_file);
     }
 }
