@@ -1,27 +1,32 @@
+mod keymap;
+mod status_bar;
+
+use std::collections::BTreeSet;
+use std::io::{Stdout, stdout};
+
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEvent,
         MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use karet_core::Highlights;
-use karet_editor::{Editor, EditorState, editing};
+use karet_core::{FoldRegions, Highlights, LineCol, Range};
+use karet_editor::{Editor, EditorState, Fold, editing, resolve_folds};
 use karet_syntax::Highlighter;
 use karet_text::TextBuffer;
 use karet_theme::Theme;
 use karet_treesitter::{
     LanguageId, ParserPool, SyntaxTree, language_id_from_injection_name,
 };
+use keymap::{Action, map_key};
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
     layout::{Constraint, Flex, Layout, Position, Rect},
-    style::Style,
-    text::Line,
 };
-use std::io::stdout;
+use status_bar::{StatusBar, StatusBarConfig};
 
 struct SyntaxHighlighter {
     pool: ParserPool,
@@ -40,9 +45,14 @@ impl SyntaxHighlighter {
         })
     }
 
-    fn highlight(&mut self, text: &str) -> Option<Highlights> {
-        let tree = SyntaxTree::parse(&mut self.pool, self.lang, text).ok()?;
-        self.highlighter.highlight(&tree, text).ok()
+    fn analyze(&mut self, text: &str) -> (Option<Highlights>, FoldRegions) {
+        if let Ok(tree) = SyntaxTree::parse(&mut self.pool, self.lang, text) {
+            let highlights = self.highlighter.highlight(&tree, text).ok();
+            let folds = karet_syntax::fold(&tree);
+            (highlights, folds)
+        } else {
+            (None, FoldRegions::default())
+        }
     }
 }
 
@@ -50,21 +60,356 @@ fn split_viewport(area: Rect) -> (Rect, Rect) {
     let [top, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)])
         .flex(Flex::End)
         .areas(area);
-    (top, bottom)
+    [top, bottom].into()
 }
 
-fn main() -> anyhow::Result<()> {
+fn init_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     execute!(stdout(), EnableMouseCapture)?;
-
     let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::with_options(
+    let terminal = Terminal::with_options(
         backend,
         TerminalOptions {
             viewport: Viewport::Inline(10),
         },
     )?;
+    Ok(terminal)
+}
 
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    viewport_area: Rect,
+) -> anyhow::Result<()> {
+    terminal.clear()?;
+    terminal.set_cursor_position(Position::new(viewport_area.x, viewport_area.y))?;
+    terminal.show_cursor()?;
+    execute!(stdout(), DisableMouseCapture)?;
+    disable_raw_mode()?;
+    Ok(())
+}
+
+fn toggle_comment_on_current_line(
+    buffer: &mut TextBuffer,
+    state: &EditorState,
+) -> anyhow::Result<()> {
+    let line_idx = state.cursor().line;
+    let line_str = buffer.line(line_idx as usize).unwrap_or_default();
+    let trimmed = line_str.trim_start();
+    let indent_len = u32::try_from(line_str.len() - trimmed.len()).unwrap_or(u32::MAX);
+
+    if trimmed.starts_with("// ") {
+        let range = Range {
+            start: LineCol::new(line_idx, indent_len),
+            end: LineCol::new(line_idx, indent_len.saturating_add(3)),
+        };
+        let edit = editing::insert(range.start, Some(range), buffer.version(), "");
+        buffer.apply_simple(&edit.change)?;
+    } else {
+        let range = Range {
+            start: LineCol::new(line_idx, indent_len),
+            end: LineCol::new(line_idx, indent_len),
+        };
+        let edit = editing::insert(range.start, Some(range), buffer.version(), "// ");
+        buffer.apply_simple(&edit.change)?;
+    }
+    Ok(())
+}
+
+fn toggle_fold_at_cursor(
+    folds: &FoldRegions,
+    folded: &mut BTreeSet<u32>,
+    state: &mut EditorState,
+    buffer: &TextBuffer,
+) {
+    let cursor_line = state.cursor().line;
+    if let Some(r) = folds
+        .regions()
+        .iter()
+        .rfind(|r| r.start <= cursor_line && cursor_line <= r.end)
+    {
+        let start = r.start;
+        if !folded.remove(&start) {
+            folded.insert(start);
+            if state.cursor().line > start {
+                state.goto(buffer, LineCol::new(start, 0));
+            }
+        }
+    }
+}
+
+fn handle_motion_action(action: Action, buffer: &TextBuffer, state: &mut EditorState) -> bool {
+    match action {
+        Action::MoveLeft { extend } => {
+            state.move_left(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::MoveRight { extend } => {
+            state.move_right(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::MoveUp { extend } => {
+            state.move_up(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::MoveDown { extend } => {
+            state.move_down(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::MoveWordLeft { extend } => {
+            state.move_word_left(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::MoveWordRight { extend } => {
+            state.move_word_right(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::MoveLineStart { extend } => {
+            state.move_line_start(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::MoveLineEnd { extend } => {
+            state.move_line_end(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::MoveDocStart { extend } => {
+            state.move_doc_start(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::MoveDocEnd { extend } => {
+            state.move_doc_end(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::PageUp { extend } => {
+            state.page_up(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::PageDown { extend } => {
+            state.page_down(buffer);
+            if !extend {
+                state.clear_selection();
+            }
+            true
+        }
+        Action::SelectAll => {
+            state.select_all(buffer);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_edit_action(
+    action: Action,
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+) -> anyhow::Result<bool> {
+    match action {
+        Action::InsertChar(c) => {
+            let edit = editing::insert(
+                state.cursor(),
+                state.selection_range(),
+                buffer.version(),
+                &c.to_string(),
+            );
+            buffer.apply_simple(&edit.change)?;
+            state.goto(buffer, edit.caret);
+            Ok(true)
+        }
+        Action::InsertTab => {
+            let edit = editing::insert(
+                state.cursor(),
+                state.selection_range(),
+                buffer.version(),
+                "    ",
+            );
+            buffer.apply_simple(&edit.change)?;
+            state.goto(buffer, edit.caret);
+            Ok(true)
+        }
+        Action::InsertNewline => {
+            let edit = editing::newline(
+                state.cursor(),
+                state.selection_range(),
+                buffer,
+                buffer.version(),
+            );
+            buffer.apply_simple(&edit.change)?;
+            state.goto(buffer, edit.caret);
+            Ok(true)
+        }
+        Action::DeleteBackward => {
+            if let Some(edit) = editing::backspace(
+                state.cursor(),
+                state.selection_range(),
+                buffer,
+                buffer.version(),
+            ) {
+                buffer.apply_simple(&edit.change)?;
+                state.goto(buffer, edit.caret);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        Action::DeleteForward => {
+            if let Some(edit) = editing::delete_forward(
+                state.cursor(),
+                state.selection_range(),
+                buffer,
+                buffer.version(),
+            ) {
+                buffer.apply_simple(&edit.change)?;
+                state.goto(buffer, edit.caret);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        Action::DeleteWordBackward => {
+            if let Some(edit) = editing::delete_word_backward(
+                state.cursor(),
+                state.selection_range(),
+                buffer,
+                buffer.version(),
+            ) {
+                buffer.apply_simple(&edit.change)?;
+                state.goto(buffer, edit.caret);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        Action::DeleteWordForward => {
+            if let Some(edit) = editing::delete_word_forward(
+                state.cursor(),
+                state.selection_range(),
+                buffer,
+                buffer.version(),
+            ) {
+                buffer.apply_simple(&edit.change)?;
+                state.goto(buffer, edit.caret);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+fn handle_action(
+    action: Action,
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    folds: &FoldRegions,
+    folded: &mut BTreeSet<u32>,
+) -> anyhow::Result<(bool, bool)> {
+    if handle_motion_action(action, buffer, state) {
+        return Ok((false, false));
+    }
+    if handle_edit_action(action, buffer, state)? {
+        return Ok((true, false));
+    }
+
+    match action {
+        Action::Quit => Ok((false, true)),
+        Action::Undo => {
+            if let Some(applied) = buffer.undo() {
+                if let Some(cursor) = applied.restored_cursor {
+                    state.set_cursor_state(buffer, cursor);
+                }
+                Ok((true, false))
+            } else {
+                Ok((false, false))
+            }
+        }
+        Action::ToggleFold => {
+            toggle_fold_at_cursor(folds, folded, state, buffer);
+            Ok((false, false))
+        }
+        Action::ToggleComment => {
+            toggle_comment_on_current_line(buffer, state)?;
+            Ok((true, false))
+        }
+        _ => Ok((false, false)),
+    }
+}
+
+fn handle_mouse_event(
+    mouse: MouseEvent,
+    buffer: &TextBuffer,
+    state: &mut EditorState,
+    editor_area: Rect,
+    resolved_folds: &[Fold],
+    folded: &mut BTreeSet<u32>,
+) {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(line) = state.gutter_marker_line_at(
+                editor_area,
+                buffer,
+                resolved_folds,
+                mouse.column,
+                mouse.row,
+            ) {
+                if !folded.remove(&line) {
+                    folded.insert(line);
+                }
+            } else {
+                let pos = state.pos_at(
+                    editor_area,
+                    buffer,
+                    resolved_folds,
+                    mouse.column,
+                    mouse.row,
+                );
+                state.set_caret(buffer, pos);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            state.scroll_to_line(state.scroll_line.saturating_add(1));
+        }
+        MouseEventKind::ScrollUp => {
+            state.scroll_to_line(state.scroll_line.saturating_sub(1));
+        }
+        _ => {}
+    }
+}
+
+fn run_editor_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<Rect> {
     let content = r#"// 10-line inline editor inside shell
 // Press Esc to exit
 fn main() {
@@ -79,30 +424,43 @@ fn main() {
     let mut state = EditorState::new();
     let theme = Theme::dark();
     let mut syntax_highlighter = SyntaxHighlighter::new("rust");
-    let mut highlights = syntax_highlighter
+    let (mut highlights, mut folds) = syntax_highlighter
         .as_mut()
-        .and_then(|sh| sh.highlight(&buffer.text()));
+        .map_or_else(|| (None, FoldRegions::default()), |sh| sh.analyze(&buffer.text()));
 
-    let status_bar = Line::from("Press Esc to exit").style(Style::new().dim());
+    let mut folded: BTreeSet<u32> = BTreeSet::new();
     let mut viewport_area = Rect::default();
     let mut editor_area = Rect::default();
 
     loop {
+        let resolved_folds = resolve_folds(&folds, &folded);
+
         terminal.draw(|frame| {
             let area = frame.area();
             viewport_area = area;
             let (top, bottom) = split_viewport(area);
             editor_area = top;
 
-            let mut editor_widget = Editor::new(&buffer).theme(&theme).focused(true);
+            let mut editor_widget = Editor::new(&buffer)
+                .theme(&theme)
+                .folds(&resolved_folds)
+                .focused(true);
             if let Some(ref h) = highlights {
                 editor_widget = editor_widget.highlights(h);
             }
 
             frame.render_stateful_widget(editor_widget, editor_area, &mut state);
-            frame.render_widget(&status_bar, bottom);
 
-            if let Some((x, y)) = state.primary_caret_cell(editor_area, &buffer, &[]) {
+            let status_config = StatusBarConfig {
+                cursor: state.cursor(),
+                selection: state.selection_range(),
+                language: "Rust",
+                encoding: "UTF-8",
+                eol: "LF",
+            };
+            StatusBar::new(&theme, &status_config).draw(frame, bottom);
+
+            if let Some((x, y)) = state.primary_caret_cell(editor_area, &buffer, &resolved_folds) {
                 frame.set_cursor_position(Position::new(x, y));
             }
         })?;
@@ -111,136 +469,50 @@ fn main() {
             let mut text_changed = false;
 
             match event::read()? {
-                Event::Key(key) => {
-                    if key.kind != crossterm::event::KeyEventKind::Press {
-                        continue;
+                Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+                    let action = map_key(key);
+                    let (changed, should_exit) = handle_action(
+                        action,
+                        &mut buffer,
+                        &mut state,
+                        &folds,
+                        &mut folded,
+                    )?;
+                    if should_exit {
+                        break;
                     }
-                    match (key.modifiers, key.code) {
-                        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Esc) => {
-                            break;
-                        }
-                        (KeyModifiers::CONTROL, KeyCode::Char('z')) => {
-                            if let Some(applied) = buffer.undo() {
-                                if let Some(cursor) = applied.restored_cursor {
-                                    state.set_cursor_state(&buffer, cursor);
-                                }
-                                text_changed = true;
-                            }
-                        }
-                        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Left) => {
-                            state.move_left(&buffer);
-                        }
-                        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Right) => {
-                            state.move_right(&buffer);
-                        }
-                        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Up) => {
-                            state.move_up(&buffer);
-                        }
-                        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Down) => {
-                            state.move_down(&buffer);
-                        }
-                        (KeyModifiers::NONE, KeyCode::Home) => {
-                            state.move_line_start(&buffer);
-                        }
-                        (KeyModifiers::NONE, KeyCode::End) => {
-                            state.move_line_end(&buffer);
-                        }
-                        (KeyModifiers::NONE, KeyCode::PageUp) => {
-                            state.page_up(&buffer);
-                        }
-                        (KeyModifiers::NONE, KeyCode::PageDown) => {
-                            state.page_down(&buffer);
-                        }
-                        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
-                            let edit = editing::insert(
-                                state.cursor(),
-                                state.selection_range(),
-                                buffer.version(),
-                                &c.to_string(),
-                            );
-                            buffer.apply_simple(&edit.change)?;
-                            state.goto(&buffer, edit.caret);
-                            text_changed = true;
-                        }
-                        (KeyModifiers::NONE, KeyCode::Tab) => {
-                            let edit = editing::insert(
-                                state.cursor(),
-                                state.selection_range(),
-                                buffer.version(),
-                                "    ",
-                            );
-                            buffer.apply_simple(&edit.change)?;
-                            state.goto(&buffer, edit.caret);
-                            text_changed = true;
-                        }
-                        (KeyModifiers::NONE, KeyCode::Enter) => {
-                            let edit = editing::newline(
-                                state.cursor(),
-                                state.selection_range(),
-                                &buffer,
-                                buffer.version(),
-                            );
-                            buffer.apply_simple(&edit.change)?;
-                            state.goto(&buffer, edit.caret);
-                            text_changed = true;
-                        }
-                        (KeyModifiers::NONE, KeyCode::Backspace) => {
-                            if let Some(edit) = editing::backspace(
-                                state.cursor(),
-                                state.selection_range(),
-                                &buffer,
-                                buffer.version(),
-                            ) {
-                                buffer.apply_simple(&edit.change)?;
-                                state.goto(&buffer, edit.caret);
-                                text_changed = true;
-                            }
-                        }
-                        (KeyModifiers::NONE, KeyCode::Delete) => {
-                            if let Some(edit) = editing::delete_forward(
-                                state.cursor(),
-                                state.selection_range(),
-                                &buffer,
-                                buffer.version(),
-                            ) {
-                                buffer.apply_simple(&edit.change)?;
-                                state.goto(&buffer, edit.caret);
-                                text_changed = true;
-                            }
-                        }
-                        _ => {}
-                    }
+                    text_changed = changed;
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let pos = state.pos_at(editor_area, &buffer, &[], mouse.column, mouse.row);
-                        state.set_caret(&buffer, pos);
-                    }
-                    MouseEventKind::ScrollDown => {
-                        state.scroll_to_line(state.scroll_line.saturating_add(1));
-                    }
-                    MouseEventKind::ScrollUp => {
-                        state.scroll_to_line(state.scroll_line.saturating_sub(1));
-                    }
-                    _ => {}
-                },
+                Event::Mouse(mouse) => {
+                    handle_mouse_event(
+                        mouse,
+                        &buffer,
+                        &mut state,
+                        editor_area,
+                        &resolved_folds,
+                        &mut folded,
+                    );
+                }
                 _ => {}
             }
 
             if text_changed
                 && let Some(ref mut sh) = syntax_highlighter
             {
-                highlights = sh.highlight(&buffer.text());
+                let (new_highlights, new_folds) = sh.analyze(&buffer.text());
+                highlights = new_highlights;
+                folds = new_folds;
             }
         }
     }
 
-    terminal.clear()?;
-    terminal.set_cursor_position(Position::new(viewport_area.x, viewport_area.y))?;
-    terminal.show_cursor()?;
-    execute!(stdout(), DisableMouseCapture)?;
-    disable_raw_mode()?;
+    Ok(viewport_area)
+}
 
+fn main() -> anyhow::Result<()> {
+    let mut terminal = init_terminal()?;
+    let viewport_area = run_editor_loop(&mut terminal)?;
+    restore_terminal(&mut terminal, viewport_area)?;
     Ok(())
 }
 
@@ -267,32 +539,77 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_editing_operations() {
-        let mut buffer = TextBuffer::from_text("hello");
-        let edit = editing::insert(
-            karet_core::LineCol::new(0, 5),
-            None,
-            buffer.version(),
-            " world",
-        );
-        buffer.apply_simple(&edit.change).unwrap();
-        assert_eq!(buffer.text(), "hello world");
-        assert_eq!(edit.caret, karet_core::LineCol::new(0, 11));
+    fn test_cursor_move_without_extend_clears_selection() {
+        let mut buffer = TextBuffer::from_text("line 1\nline 2");
+        let mut state = EditorState::new();
+        let folds = FoldRegions::default();
+        let mut folded = BTreeSet::new();
 
-        let backspace_edit =
-            editing::backspace(edit.caret, None, &buffer, buffer.version()).unwrap();
-        buffer.apply_simple(&backspace_edit.change).unwrap();
-        assert_eq!(buffer.text(), "hello worl");
-        assert_eq!(backspace_edit.caret, karet_core::LineCol::new(0, 10));
+        // Move right without extend
+        let (changed, exit) = handle_action(
+            Action::MoveRight { extend: false },
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+
+        assert!(!changed);
+        assert!(!exit);
+        assert_eq!(state.cursor(), LineCol::new(0, 1));
+        let sel = state.selection_range();
+        assert!(sel.is_none() || sel.unwrap().start == sel.unwrap().end);
     }
 
     #[test]
-    fn test_syntax_highlighter_initialization() {
-        let mut highlighter = SyntaxHighlighter::new("rust");
-        assert!(highlighter.is_some());
-        let hl = highlighter.as_mut().unwrap();
-        let spans = hl.highlight("fn main() {}");
-        assert!(spans.is_some());
-        assert!(!spans.unwrap().all().is_empty());
+    fn test_cursor_move_with_extend_creates_selection() {
+        let mut buffer = TextBuffer::from_text("line 1\nline 2");
+        let mut state = EditorState::new();
+        let folds = FoldRegions::default();
+        let mut folded = BTreeSet::new();
+
+        // Move right with extend = true
+        handle_action(
+            Action::MoveRight { extend: true },
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+
+        assert_eq!(state.cursor(), LineCol::new(0, 1));
+        let sel = state.selection_range().unwrap();
+        assert_eq!(sel.start, LineCol::new(0, 0));
+        assert_eq!(sel.end, LineCol::new(0, 1));
+    }
+
+    #[test]
+    fn test_toggle_comment() {
+        let mut buffer = TextBuffer::from_text("fn test() {}");
+        let mut state = EditorState::new();
+        let folds = FoldRegions::default();
+        let mut folded = BTreeSet::new();
+
+        handle_action(
+            Action::ToggleComment,
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "// fn test() {}");
+
+        handle_action(
+            Action::ToggleComment,
+            &mut buffer,
+            &mut state,
+            &folds,
+            &mut folded,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "fn test() {}");
     }
 }
