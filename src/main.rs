@@ -16,14 +16,22 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use karet_core::{FoldRegions, Highlights, LineCol, Range};
-use karet_editor::{Editor, EditorState, Fold, Motion, editing, resolve_folds};
-use karet_filetype::file_type_for_path;
-use karet_syntax::Highlighter;
+use karet_core::{AppliedEdit, FoldRegions, Highlights, LineCol, Range};
+use karet_editor::{
+    Editor, EditorState, Fold, Motion, editing,
+    editing::LineComment,
+    editing::autopair::{self, AutoClose, AutoPairs},
+    resolve_folds,
+};
+use karet_filetype::{CommentTokens, all_file_types, file_type_for_path};
+use karet_syntax::{
+    Folder, Indenter, LayeredHighlighter, SemanticCommentConfig, mark_semantic_comments,
+};
 use karet_text::TextBuffer;
 use karet_theme::Theme;
 use karet_treesitter::{
-    LanguageId, ParserPool, SyntaxTree, language_id_from_path,
+    LanguageId, LayeredParser, LayeredTree, injections_query, language_id_from_injection_name,
+    language_id_from_path,
 };
 use keymap::{Action, EditorMode, map_key};
 use ratatui::{
@@ -107,30 +115,121 @@ where
     Ok(Some(CliArgs { mode, destination }))
 }
 
-struct SyntaxHighlighter {
-    pool: ParserPool,
-    highlighter: Highlighter,
+struct SyntaxState {
+    parser: LayeredParser,
+    highlighter: LayeredHighlighter,
+    folder: Folder,
+    indenter: Option<Indenter>,
+    tree: Option<LayeredTree>,
     lang: LanguageId,
+    raw_highlights: Option<Highlights>,
+    rendered_highlights: Option<Highlights>,
+    folds: FoldRegions,
+    pending_edits: Vec<AppliedEdit>,
+    semantic_config: SemanticCommentConfig,
 }
 
-impl SyntaxHighlighter {
-    fn new(lang: LanguageId) -> Option<Self> {
-        let highlighter = Highlighter::new(lang).ok()?;
-        Some(Self {
-            pool: ParserPool::new(),
+impl SyntaxState {
+    fn new(lang: LanguageId, text: &str) -> Self {
+        let mut parser = LayeredParser::new();
+        let mut highlighter = LayeredHighlighter::new();
+        let mut folder = Folder::new();
+        let tree = parser.parse(lang, text).ok();
+        let indenter = tree.as_ref().map(Indenter::for_tree);
+        let raw_highlights = tree.as_ref().map(|t| highlighter.highlight(t, text));
+        let folds = tree
+            .as_ref()
+            .map_or_else(FoldRegions::default, |t| folder.analyze(t.root(), text));
+        let semantic_config = SemanticCommentConfig::default();
+        let rendered_highlights = raw_highlights
+            .as_ref()
+            .map(|raw| mark_semantic_comments(text, raw, &semantic_config));
+
+        Self {
+            parser,
             highlighter,
+            folder,
+            indenter,
+            tree,
             lang,
-        })
+            raw_highlights,
+            rendered_highlights,
+            folds,
+            pending_edits: Vec::new(),
+            semantic_config,
+        }
     }
 
-    fn analyze(&mut self, text: &str) -> (Option<Highlights>, FoldRegions) {
-        if let Ok(tree) = SyntaxTree::parse(&mut self.pool, self.lang, text) {
-            let highlights = self.highlighter.highlight(&tree, text).ok();
-            let folds = karet_syntax::fold(&tree);
-            (highlights, folds)
-        } else {
-            (None, FoldRegions::default())
+    fn record_edits(&mut self, edits: &[AppliedEdit]) {
+        self.pending_edits.extend_from_slice(edits);
+    }
+
+    fn update(&mut self, text: &str) {
+        if self.pending_edits.is_empty() {
+            return;
         }
+
+        let mut changed = None;
+        if let Some(mut tree) = self.tree.take() {
+            match self
+                .parser
+                .reparse_changed(&mut tree, &self.pending_edits, text)
+            {
+                Ok(ranges) => {
+                    changed = Some(ranges);
+                    self.tree = Some(tree);
+                }
+                Err(_) => {
+                    self.tree = self.parser.parse(self.lang, text).ok();
+                }
+            }
+        } else {
+            self.tree = self.parser.parse(self.lang, text).ok();
+        }
+
+        if let Some(tree) = &self.tree {
+            let raw = if let Some(ranges) = changed
+                && let Some(prev) = &self.raw_highlights
+            {
+                self.highlighter
+                    .rehighlight(tree, text, prev, &self.pending_edits, &ranges)
+            } else {
+                self.highlighter.highlight(tree, text)
+            };
+            self.rendered_highlights =
+                Some(mark_semantic_comments(text, &raw, &self.semantic_config));
+            self.raw_highlights = Some(raw);
+            self.indenter = Some(Indenter::for_tree(tree));
+            self.folds = self.folder.analyze(tree.root(), text);
+        } else {
+            self.raw_highlights = None;
+            self.rendered_highlights = None;
+            self.indenter = None;
+            self.folds = FoldRegions::default();
+        }
+
+        self.pending_edits.clear();
+    }
+
+    fn compute_newline_indent_range(&self, buffer: &TextBuffer, range: Range) -> Option<String> {
+        let indenter = self.indenter.as_ref()?;
+        let tree = self.tree.as_ref()?;
+        let before = buffer.line_col_to_byte(range.start).ok()?;
+        let after = buffer.line_col_to_byte(range.end).ok()?;
+        indenter.newline_indent(tree, &buffer.text(), (before, after), "    ")
+    }
+
+    fn compute_newline_indent(
+        &self,
+        buffer: &TextBuffer,
+        caret: LineCol,
+        selection: Option<Range>,
+    ) -> Option<String> {
+        let range = selection.unwrap_or(Range {
+            start: caret,
+            end: caret,
+        });
+        self.compute_newline_indent_range(buffer, range)
     }
 }
 
@@ -142,7 +241,10 @@ fn save_buffer(buffer: &mut TextBuffer, path: &std::path::Path) -> anyhow::Resul
     };
     result.map(|_| ()).map_err(|e| match e {
         karet_text::TextError::Conflict => {
-            anyhow::anyhow!("conflict: file was modified externally on disk: {}", path.display())
+            anyhow::anyhow!(
+                "conflict: file was modified externally on disk: {}",
+                path.display()
+            )
         }
         other => anyhow::anyhow!("{other}"),
     })
@@ -232,11 +334,7 @@ impl Drop for TerminalGuard {
                 );
             } else if let Ok(tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
                 let mut backend = CrosstermBackend::new(tty);
-                let _ = execute!(
-                    backend,
-                    PopKeyboardEnhancementFlags,
-                    DisableMouseCapture
-                );
+                let _ = execute!(backend, PopKeyboardEnhancementFlags, DisableMouseCapture);
             }
         }
         if self.stage != GuardStage::Restored {
@@ -253,34 +351,278 @@ fn split_viewport(area: Rect) -> (Rect, Rect) {
     [top, bottom].into()
 }
 
-fn toggle_comment_on_current_line(
-    buffer: &mut TextBuffer,
-    state: &EditorState,
-) -> anyhow::Result<()> {
-    let line_idx = state.cursor().line;
-    let line_str = buffer.line(line_idx as usize).unwrap_or_default();
-    let trimmed = line_str.trim_start();
-    let indent_len = u32::try_from(line_str.len() - trimmed.len()).unwrap_or(u32::MAX);
-
-    if trimmed.starts_with("// ") {
-        let range = Range {
-            start: LineCol::new(line_idx, indent_len),
-            end: LineCol::new(line_idx, indent_len.saturating_add(3)),
-        };
-        let edit = editing::insert(range.start, Some(range), buffer.version(), "");
-        buffer.apply_simple(&edit.change)?;
-    } else {
-        let range = Range {
-            start: LineCol::new(line_idx, indent_len),
-            end: LineCol::new(line_idx, indent_len),
-        };
-        let edit = editing::insert(range.start, Some(range), buffer.version(), "// ");
-        buffer.apply_simple(&edit.change)?;
-    }
-    Ok(())
+fn tokens_for_language(lang: LanguageId) -> CommentTokens {
+    all_file_types()
+        .iter()
+        .find(|ft| ft.grammar().and_then(language_id_from_injection_name) == Some(lang))
+        .map_or(
+            CommentTokens::NONE,
+            karet_filetype::FileType::comment_tokens,
+        )
 }
 
-fn handle_motion_action(action: Action, buffer: &TextBuffer, state: &mut EditorState) -> bool {
+fn probe_comment_pos(buffer: &TextBuffer, range: Range) -> LineCol {
+    let from = range.start.col as usize;
+    let col = buffer.line(range.start.line as usize).and_then(|text| {
+        let indices: Vec<usize> = text
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| !c.is_whitespace())
+            .map(|(i, _)| i)
+            .collect();
+        indices
+            .iter()
+            .copied()
+            .find(|&i| i >= from)
+            .or_else(|| indices.iter().copied().take_while(|&i| i < from).last())
+            .and_then(|i| u32::try_from(i).ok())
+    });
+    LineCol::new(range.start.line, col.unwrap_or(range.start.col))
+}
+
+fn comment_tokens_at(
+    destination: &OutputDestination,
+    buffer: &TextBuffer,
+    pos: LineCol,
+    syntax_state: Option<&SyntaxState>,
+) -> CommentTokens {
+    let own = match destination {
+        OutputDestination::File(path) => file_type_for_path(path).comment_tokens(),
+        OutputDestination::Stdout => CommentTokens::NONE,
+    };
+    let Some(syntax) = syntax_state else {
+        return own;
+    };
+    let Some(tree) = &syntax.tree else {
+        return own;
+    };
+    if injections_query(syntax.lang).is_none() {
+        return own;
+    }
+    let Ok(byte) = buffer.line_col_to_byte(pos) else {
+        return own;
+    };
+    let layers = tree.layers_at(byte);
+    let host = layers
+        .iter()
+        .rposition(|layer| {
+            layer
+                .named_ancestors_at(byte)
+                .iter()
+                .any(|node| node.kind.contains("comment"))
+        })
+        .unwrap_or(0);
+    layers
+        .iter()
+        .skip(host)
+        .map(|layer| layer.language())
+        .map(|lang| {
+            if lang == syntax.lang {
+                own
+            } else {
+                tokens_for_language(lang)
+            }
+        })
+        .find(|tokens| !tokens.is_empty())
+        .unwrap_or(own)
+}
+
+fn apply_single_edit(
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    syntax_state: &mut Option<SyntaxState>,
+    edit: &editing::Edit,
+) -> anyhow::Result<bool> {
+    let applied = buffer.apply_simple(&edit.change)?;
+    if let Some(syn) = syntax_state {
+        syn.record_edits(&applied.edits);
+    }
+    state.goto(buffer, edit.caret);
+    Ok(true)
+}
+
+fn apply_opt_single_edit(
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    syntax_state: &mut Option<SyntaxState>,
+    edit: Option<editing::Edit>,
+) -> anyhow::Result<bool> {
+    edit.map_or_else(
+        || Ok(false),
+        |e| apply_single_edit(buffer, state, syntax_state, &e),
+    )
+}
+
+fn apply_multi_edit(
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    syntax_state: &mut Option<SyntaxState>,
+    multi: editing::MultiEdit,
+) -> anyhow::Result<bool> {
+    let applied = buffer.apply_simple(&multi.change)?;
+    if let Some(syn) = syntax_state {
+        syn.record_edits(&applied.edits);
+    }
+    state.set_cursor_state(buffer, multi.cursors);
+    Ok(true)
+}
+
+fn apply_opt_multi_edit(
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    syntax_state: &mut Option<SyntaxState>,
+    multi: Option<editing::MultiEdit>,
+) -> anyhow::Result<bool> {
+    multi.map_or_else(
+        || Ok(false),
+        |m| apply_multi_edit(buffer, state, syntax_state, m),
+    )
+}
+
+fn toggle_comment(
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    destination: &OutputDestination,
+    syntax_state: &mut Option<SyntaxState>,
+) -> anyhow::Result<bool> {
+    let pos = probe_comment_pos(buffer, state.cursors().primary().range());
+    let tokens = comment_tokens_at(destination, buffer, pos, syntax_state.as_ref());
+    let token = match (tokens.line(), tokens.block()) {
+        (Some(prefix), _) => LineComment::Prefix(prefix),
+        (None, Some((open, close))) => LineComment::Wrap { open, close },
+        (None, None) => return Ok(false),
+    };
+    let multi = editing::toggle_line_comment(buffer, state.cursors(), buffer.version(), token);
+    apply_opt_multi_edit(buffer, state, syntax_state, multi)
+}
+
+fn auto_pairs_for_destination(destination: &OutputDestination) -> &'static [(char, char)] {
+    match destination {
+        OutputDestination::File(path) => file_type_for_path(path).auto_pairs(),
+        OutputDestination::Stdout => {
+            file_type_for_path(std::path::Path::new("prompt.txt")).auto_pairs()
+        }
+    }
+}
+
+fn resolve_auto_pairs<'a>(
+    destination: &OutputDestination,
+    syntax_state: Option<&'a SyntaxState>,
+) -> AutoPairs<'a> {
+    AutoPairs {
+        pairs: auto_pairs_for_destination(destination),
+        brackets: AutoClose::LanguageDefined,
+        quotes: AutoClose::LanguageDefined,
+        highlights: syntax_state.and_then(|s| s.rendered_highlights.as_ref()),
+    }
+}
+
+fn handle_insert_char(
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    destination: &OutputDestination,
+    syntax_state: &mut Option<SyntaxState>,
+    auto_closers: &mut Vec<LineCol>,
+    c: char,
+) -> anyhow::Result<bool> {
+    let rules = resolve_auto_pairs(destination, syntax_state.as_ref());
+    if let Some(typed) = autopair::type_char(
+        buffer,
+        state.cursors(),
+        buffer.version(),
+        c,
+        &rules,
+        auto_closers,
+    ) {
+        *auto_closers = typed.closers;
+        if let Some(edit) = typed.edit {
+            apply_multi_edit(buffer, state, syntax_state, edit)
+        } else {
+            state.set_cursor_state(buffer, typed.cursors);
+            Ok(true)
+        }
+    } else {
+        auto_closers.clear();
+        let edit = editing::insert(
+            state.cursor(),
+            state.selection_range(),
+            buffer.version(),
+            &c.to_string(),
+        );
+        apply_single_edit(buffer, state, syntax_state, &edit)
+    }
+}
+
+fn handle_insert_newline(
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    destination: &OutputDestination,
+    syntax_state: &mut Option<SyntaxState>,
+    auto_closers: &mut Vec<LineCol>,
+) -> anyhow::Result<bool> {
+    auto_closers.clear();
+    let rules = resolve_auto_pairs(destination, syntax_state.as_ref());
+    let indent_fn = |range: Range| {
+        syntax_state
+            .as_ref()
+            .and_then(|syn| syn.compute_newline_indent_range(buffer, range))
+    };
+    if let Some(edit) = autopair::newline_indented(
+        buffer,
+        state.cursors(),
+        buffer.version(),
+        &rules,
+        "    ",
+        &indent_fn,
+    ) {
+        apply_multi_edit(buffer, state, syntax_state, edit)
+    } else {
+        let indent = syntax_state.as_ref().and_then(|syn| {
+            syn.compute_newline_indent(buffer, state.cursor(), state.selection_range())
+        });
+        let edit = editing::newline_indented(
+            state.cursor(),
+            state.selection_range(),
+            buffer,
+            buffer.version(),
+            indent.as_deref(),
+        );
+        apply_single_edit(buffer, state, syntax_state, &edit)
+    }
+}
+
+fn handle_backspace(
+    buffer: &mut TextBuffer,
+    state: &mut EditorState,
+    destination: &OutputDestination,
+    syntax_state: &mut Option<SyntaxState>,
+    auto_closers: &mut Vec<LineCol>,
+) -> anyhow::Result<bool> {
+    auto_closers.clear();
+    let rules = resolve_auto_pairs(destination, syntax_state.as_ref());
+    if let Some(edit) = autopair::backspace(buffer, state.cursors(), buffer.version(), &rules) {
+        apply_multi_edit(buffer, state, syntax_state, edit)
+    } else {
+        apply_opt_single_edit(
+            buffer,
+            state,
+            syntax_state,
+            editing::backspace(
+                state.cursor(),
+                state.selection_range(),
+                buffer,
+                buffer.version(),
+            ),
+        )
+    }
+}
+
+fn handle_motion_action(
+    action: Action,
+    buffer: &TextBuffer,
+    state: &mut EditorState,
+    auto_closers: &mut Vec<LineCol>,
+) -> bool {
     let (motion, extend) = match action {
         Action::MoveLeft { extend } => (Motion::Left, extend),
         Action::MoveRight { extend } => (Motion::Right, extend),
@@ -296,11 +638,13 @@ fn handle_motion_action(action: Action, buffer: &TextBuffer, state: &mut EditorS
         Action::PageDown { extend } => (Motion::PageDown, extend),
         Action::SelectAll => {
             state.select_all(buffer);
+            auto_closers.clear();
             return true;
         }
         _ => return false,
     };
     state.move_carets(buffer, motion, extend);
+    auto_closers.clear();
     true
 }
 
@@ -308,96 +652,79 @@ fn handle_edit_action(
     action: Action,
     buffer: &mut TextBuffer,
     state: &mut EditorState,
+    destination: &OutputDestination,
+    syntax_state: &mut Option<SyntaxState>,
+    auto_closers: &mut Vec<LineCol>,
 ) -> anyhow::Result<bool> {
     match action {
         Action::InsertChar(c) => {
-            let edit = editing::insert(
-                state.cursor(),
-                state.selection_range(),
-                buffer.version(),
-                &c.to_string(),
-            );
-            buffer.apply_simple(&edit.change)?;
-            state.goto(buffer, edit.caret);
-            Ok(true)
+            handle_insert_char(buffer, state, destination, syntax_state, auto_closers, c)
         }
-        Action::InsertTab => {
-            let edit = editing::insert(
-                state.cursor(),
-                state.selection_range(),
-                buffer.version(),
-                "    ",
-            );
-            buffer.apply_simple(&edit.change)?;
-            state.goto(buffer, edit.caret);
-            Ok(true)
+        Action::Indent => {
+            auto_closers.clear();
+            apply_opt_multi_edit(
+                buffer,
+                state,
+                syntax_state,
+                editing::indent(buffer, state.cursors(), buffer.version(), "    ", 4),
+            )
+        }
+        Action::Dedent => {
+            auto_closers.clear();
+            apply_opt_multi_edit(
+                buffer,
+                state,
+                syntax_state,
+                editing::dedent(buffer, state.cursors(), buffer.version(), "    ", 4),
+            )
         }
         Action::InsertNewline => {
-            let edit = editing::newline(
-                state.cursor(),
-                state.selection_range(),
-                buffer,
-                buffer.version(),
-            );
-            buffer.apply_simple(&edit.change)?;
-            state.goto(buffer, edit.caret);
-            Ok(true)
+            handle_insert_newline(buffer, state, destination, syntax_state, auto_closers)
         }
         Action::DeleteBackward => {
-            if let Some(edit) = editing::backspace(
-                state.cursor(),
-                state.selection_range(),
-                buffer,
-                buffer.version(),
-            ) {
-                buffer.apply_simple(&edit.change)?;
-                state.goto(buffer, edit.caret);
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+            handle_backspace(buffer, state, destination, syntax_state, auto_closers)
         }
         Action::DeleteForward => {
-            if let Some(edit) = editing::delete_forward(
-                state.cursor(),
-                state.selection_range(),
+            auto_closers.clear();
+            apply_opt_single_edit(
                 buffer,
-                buffer.version(),
-            ) {
-                buffer.apply_simple(&edit.change)?;
-                state.goto(buffer, edit.caret);
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+                state,
+                syntax_state,
+                editing::delete_forward(
+                    state.cursor(),
+                    state.selection_range(),
+                    buffer,
+                    buffer.version(),
+                ),
+            )
         }
         Action::DeleteWordBackward => {
-            if let Some(edit) = editing::delete_word_backward(
-                state.cursor(),
-                state.selection_range(),
+            auto_closers.clear();
+            apply_opt_single_edit(
                 buffer,
-                buffer.version(),
-            ) {
-                buffer.apply_simple(&edit.change)?;
-                state.goto(buffer, edit.caret);
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+                state,
+                syntax_state,
+                editing::delete_word_backward(
+                    state.cursor(),
+                    state.selection_range(),
+                    buffer,
+                    buffer.version(),
+                ),
+            )
         }
         Action::DeleteWordForward => {
-            if let Some(edit) = editing::delete_word_forward(
-                state.cursor(),
-                state.selection_range(),
+            auto_closers.clear();
+            apply_opt_single_edit(
                 buffer,
-                buffer.version(),
-            ) {
-                buffer.apply_simple(&edit.change)?;
-                state.goto(buffer, edit.caret);
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+                state,
+                syntax_state,
+                editing::delete_word_forward(
+                    state.cursor(),
+                    state.selection_range(),
+                    buffer,
+                    buffer.version(),
+                ),
+            )
         }
         _ => Ok(false),
     }
@@ -407,17 +734,45 @@ fn handle_action(
     action: Action,
     buffer: &mut TextBuffer,
     state: &mut EditorState,
+    destination: &OutputDestination,
+    syntax_state: &mut Option<SyntaxState>,
+    auto_closers: &mut Vec<LineCol>,
 ) -> anyhow::Result<bool> {
-    if handle_motion_action(action, buffer, state) {
+    if handle_motion_action(action, buffer, state, auto_closers) {
         return Ok(false);
     }
-    if handle_edit_action(action, buffer, state)? {
+    if handle_edit_action(
+        action,
+        buffer,
+        state,
+        destination,
+        syntax_state,
+        auto_closers,
+    )? {
         return Ok(true);
     }
 
     match action {
         Action::Undo => {
+            auto_closers.clear();
             if let Some(applied) = buffer.undo() {
+                if let Some(syn) = syntax_state {
+                    syn.record_edits(&applied.edits);
+                }
+                if let Some(cursor) = applied.restored_cursor {
+                    state.set_cursor_state(buffer, cursor);
+                }
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        Action::Redo => {
+            auto_closers.clear();
+            if let Some(applied) = buffer.redo() {
+                if let Some(syn) = syntax_state {
+                    syn.record_edits(&applied.edits);
+                }
                 if let Some(cursor) = applied.restored_cursor {
                     state.set_cursor_state(buffer, cursor);
                 }
@@ -427,8 +782,8 @@ fn handle_action(
             }
         }
         Action::ToggleComment => {
-            toggle_comment_on_current_line(buffer, state)?;
-            Ok(true)
+            auto_closers.clear();
+            toggle_comment(buffer, state, destination, syntax_state)
         }
         _ => Ok(false),
     }
@@ -441,7 +796,9 @@ fn handle_mouse_event(
     editor_area: Rect,
     resolved_folds: &[Fold],
     folded: &mut BTreeSet<u32>,
+    auto_closers: &mut Vec<LineCol>,
 ) {
+    auto_closers.clear();
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(line) = state.gutter_marker_line_at(
@@ -455,13 +812,8 @@ fn handle_mouse_event(
                     folded.insert(line);
                 }
             } else {
-                let pos = state.pos_at(
-                    editor_area,
-                    buffer,
-                    resolved_folds,
-                    mouse.column,
-                    mouse.row,
-                );
+                let pos =
+                    state.pos_at(editor_area, buffer, resolved_folds, mouse.column, mouse.row);
                 state.set_caret(buffer, pos);
             }
         }
@@ -488,6 +840,8 @@ fn handle_key_press(
     cli_args: &CliArgs,
     buffer: &mut TextBuffer,
     state: &mut EditorState,
+    syntax_state: &mut Option<SyntaxState>,
+    auto_closers: &mut Vec<LineCol>,
 ) -> anyhow::Result<LoopControl> {
     if *in_confirm_discard {
         return Ok(match key.code {
@@ -534,17 +888,22 @@ fn handle_key_press(
                 text_changed: false,
             })
         }
-        Action::SaveAndAccept => {
-            match &cli_args.destination {
-                OutputDestination::File(path) => {
-                    save_buffer(buffer, path)?;
-                    Ok(LoopControl::Exit(ExitCode::SUCCESS))
-                }
-                OutputDestination::Stdout => Ok(LoopControl::AcceptStdout),
+        Action::SaveAndAccept => match &cli_args.destination {
+            OutputDestination::File(path) => {
+                save_buffer(buffer, path)?;
+                Ok(LoopControl::Exit(ExitCode::SUCCESS))
             }
-        }
+            OutputDestination::Stdout => Ok(LoopControl::AcceptStdout),
+        },
         other => {
-            let changed = handle_action(other, buffer, state)?;
+            let changed = handle_action(
+                other,
+                buffer,
+                state,
+                &cli_args.destination,
+                syntax_state,
+                auto_closers,
+            )?;
             Ok(LoopControl::Continue {
                 text_changed: changed,
             })
@@ -647,40 +1006,38 @@ enum EditorOutcome {
     Exit(ExitCode),
 }
 
-fn run_editor_loop(
-    guard: &mut TerminalGuard,
-    cli_args: &CliArgs,
-) -> anyhow::Result<EditorOutcome> {
+fn run_editor_loop(guard: &mut TerminalGuard, cli_args: &CliArgs) -> anyhow::Result<EditorOutcome> {
     let (mut buffer, file_name) = init_buffer(&cli_args.destination)?;
 
     let (lang_id, lang_name) = match &cli_args.destination {
-        OutputDestination::File(path) => (
-            language_id_from_path(path),
-            file_type_for_path(path).name(),
-        ),
+        OutputDestination::File(path) => {
+            (language_id_from_path(path), file_type_for_path(path).name())
+        }
         OutputDestination::Stdout => (None, "Plain Text"),
     };
-    let mut syntax_highlighter = lang_id.and_then(SyntaxHighlighter::new);
+    let mut syntax_state = lang_id.map(|lang| SyntaxState::new(lang, &buffer.text()));
 
     let mut state = EditorState::new();
     let theme = Theme::dark();
-    let (mut highlights, mut folds) = syntax_highlighter
-        .as_mut()
-        .map_or_else(|| (None, FoldRegions::default()), |sh| sh.analyze(&buffer.text()));
 
     let mut folded: BTreeSet<u32> = BTreeSet::new();
     let mut viewport_area = Rect::default();
     let mut editor_area = Rect::default();
     let mut in_confirm_discard = false;
+    let mut auto_closers: Vec<LineCol> = Vec::new();
 
     loop {
-        let resolved_folds = resolve_folds(&folds, &folded);
+        let empty_folds = FoldRegions::default();
+        let folds = syntax_state.as_ref().map_or(&empty_folds, |syn| &syn.folds);
+        let resolved_folds = resolve_folds(folds, &folded);
 
         let render_ctx = RenderContext {
             buffer: &buffer,
             theme: &theme,
             resolved_folds: &resolved_folds,
-            highlights: highlights.as_ref(),
+            highlights: syntax_state
+                .as_ref()
+                .and_then(|syn| syn.rendered_highlights.as_ref()),
             lang_name,
             file_name: &file_name,
             mode: cli_args.mode,
@@ -705,6 +1062,8 @@ fn run_editor_loop(
                         cli_args,
                         &mut buffer,
                         &mut state,
+                        &mut syntax_state,
+                        &mut auto_closers,
                     )? {
                         LoopControl::Continue {
                             text_changed: changed,
@@ -725,17 +1084,14 @@ fn run_editor_loop(
                         editor_area,
                         &resolved_folds,
                         &mut folded,
+                        &mut auto_closers,
                     );
                 }
                 _ => {}
             }
 
-            if text_changed
-                && let Some(ref mut sh) = syntax_highlighter
-            {
-                let (new_highlights, new_folds) = sh.analyze(&buffer.text());
-                highlights = new_highlights;
-                folds = new_folds;
+            if text_changed && let Some(ref mut syn) = syntax_state {
+                syn.update(&buffer.text());
             }
         }
     }
@@ -778,6 +1134,8 @@ fn main() -> ExitCode {
 mod tests {
     use std::path::Path;
 
+    use karet_treesitter::languages;
+
     use super::*;
 
     #[test]
@@ -807,6 +1165,9 @@ mod tests {
             Action::MoveRight { extend: false },
             &mut buffer,
             &mut state,
+            &OutputDestination::Stdout,
+            &mut None,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -825,6 +1186,9 @@ mod tests {
             Action::MoveRight { extend: true },
             &mut buffer,
             &mut state,
+            &OutputDestination::Stdout,
+            &mut None,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -838,12 +1202,336 @@ mod tests {
     fn test_toggle_comment() {
         let mut buffer = TextBuffer::from_text("fn test() {}");
         let mut state = EditorState::new();
+        let dest = OutputDestination::File(PathBuf::from("test.rs"));
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
 
-        handle_action(Action::ToggleComment, &mut buffer, &mut state).unwrap();
+        handle_action(
+            Action::ToggleComment,
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(buffer.text(), "// fn test() {}");
 
-        handle_action(Action::ToggleComment, &mut buffer, &mut state).unwrap();
+        handle_action(
+            Action::ToggleComment,
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(buffer.text(), "fn test() {}");
+    }
+
+    #[test]
+    fn test_multi_language_comment_toggling() {
+        // Python (#)
+        let mut py_buffer = TextBuffer::from_text("def hello(): pass");
+        let mut py_state = EditorState::new();
+        let py_dest = OutputDestination::File(PathBuf::from("test.py"));
+        let mut py_syntax = Some(SyntaxState::new(
+            languages::PYTHON.unwrap(),
+            &py_buffer.text(),
+        ));
+
+        handle_action(
+            Action::ToggleComment,
+            &mut py_buffer,
+            &mut py_state,
+            &py_dest,
+            &mut py_syntax,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(py_buffer.text(), "# def hello(): pass");
+
+        handle_action(
+            Action::ToggleComment,
+            &mut py_buffer,
+            &mut py_state,
+            &py_dest,
+            &mut py_syntax,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(py_buffer.text(), "def hello(): pass");
+
+        // HTML (<!-- -->)
+        let mut html_buffer = TextBuffer::from_text("<div>hello</div>");
+        let mut html_state = EditorState::new();
+        let html_dest = OutputDestination::File(PathBuf::from("index.html"));
+        let mut html_syntax = Some(SyntaxState::new(
+            languages::HTML.unwrap(),
+            &html_buffer.text(),
+        ));
+
+        handle_action(
+            Action::ToggleComment,
+            &mut html_buffer,
+            &mut html_state,
+            &html_dest,
+            &mut html_syntax,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(html_buffer.text(), "<!-- <div>hello</div> -->");
+
+        handle_action(
+            Action::ToggleComment,
+            &mut html_buffer,
+            &mut html_state,
+            &html_dest,
+            &mut html_syntax,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(html_buffer.text(), "<div>hello</div>");
+    }
+
+    #[test]
+    fn test_indent_and_dedent() {
+        let mut buffer = TextBuffer::from_text("line 1\nline 2");
+        let mut state = EditorState::new();
+        state.select_all(&buffer);
+        let dest = OutputDestination::Stdout;
+
+        handle_action(
+            Action::Indent,
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "    line 1\n    line 2");
+
+        handle_action(
+            Action::Dedent,
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "line 1\nline 2");
+    }
+
+    #[test]
+    fn test_layered_syntax_highlighting_and_incremental_reparse() {
+        let text = "# Title\n\n```rust\nfn main() {}\n```\n";
+        let syntax = SyntaxState::new(languages::MARKDOWN.unwrap(), text);
+        assert!(syntax.tree.is_some());
+        let tree = syntax.tree.as_ref().unwrap();
+        assert!(!tree.children().is_empty());
+        assert!(
+            tree.children()
+                .iter()
+                .any(|c| c.language() == languages::RUST.unwrap())
+        );
+        assert!(syntax.rendered_highlights.is_some());
+
+        // Incremental reparse parity with cold parse
+        let initial = "fn foo() -> u32 {\n    42\n}\n";
+        let mut syntax = SyntaxState::new(languages::RUST.unwrap(), initial);
+        let mut buffer = TextBuffer::from_text(initial);
+        let mut state = EditorState::new();
+        state.goto(&buffer, LineCol::new(1, 6));
+        let edit = editing::insert(state.cursor(), None, buffer.version(), " + 10");
+        let applied = buffer.apply_simple(&edit.change).unwrap();
+        syntax.record_edits(&applied.edits);
+        syntax.update(&buffer.text());
+
+        let cold_syntax = SyntaxState::new(languages::RUST.unwrap(), &buffer.text());
+        assert_eq!(
+            syntax.raw_highlights.as_ref().unwrap().all(),
+            cold_syntax.raw_highlights.as_ref().unwrap().all()
+        );
+    }
+
+    #[test]
+    fn test_grammar_indenter_on_enter() {
+        let mut buffer = TextBuffer::from_text("fn main() {");
+        let mut state = EditorState::new();
+        state.goto(&buffer, LineCol::new(0, 11));
+        let dest = OutputDestination::File(PathBuf::from("test.rs"));
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
+
+        handle_action(
+            Action::InsertNewline,
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "fn main() {\n    ");
+        assert_eq!(state.cursor(), LineCol::new(1, 4));
+    }
+
+    #[test]
+    fn test_closing_bracket_auto_dedent() {
+        let mut buffer = TextBuffer::from_text("fn main() {\n    ");
+        let mut state = EditorState::new();
+        state.goto(&buffer, LineCol::new(1, 4));
+        let dest = OutputDestination::File(PathBuf::from("test.rs"));
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
+        let mut closers = Vec::new();
+
+        handle_action(
+            Action::InsertChar('}'),
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut closers,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "fn main() {\n}");
+        assert_eq!(state.cursor(), LineCol::new(1, 1));
+    }
+
+    #[test]
+    fn test_closing_bracket_dedent_without_preexisting_pair() {
+        let mut buffer = TextBuffer::from_text("fn test() {\n    ");
+        let mut state = EditorState::new();
+        state.goto(&buffer, LineCol::new(1, 4));
+        let dest = OutputDestination::File(PathBuf::from("test.rs"));
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
+        let mut closers = Vec::new();
+
+        handle_action(
+            Action::InsertChar('}'),
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut closers,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "fn test() {\n}");
+        assert_eq!(state.cursor(), LineCol::new(1, 1));
+    }
+
+    #[test]
+    fn test_autopair_insert_and_step_over() {
+        let mut buffer = TextBuffer::from_text("");
+        let mut state = EditorState::new();
+        let dest = OutputDestination::File(PathBuf::from("test.rs"));
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
+        let mut closers = Vec::new();
+
+        // Typing '{' inserts '{}' with cursor inside
+        handle_action(
+            Action::InsertChar('{'),
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut closers,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "{}");
+        assert_eq!(state.cursor(), LineCol::new(0, 1));
+        assert_eq!(closers, vec![LineCol::new(0, 1)]);
+
+        // Typing '}' steps over the closer
+        handle_action(
+            Action::InsertChar('}'),
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut closers,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "{}");
+        assert_eq!(state.cursor(), LineCol::new(0, 2));
+        assert_eq!(closers, []);
+    }
+
+    #[test]
+    fn test_autopair_empty_backspace() {
+        let mut buffer = TextBuffer::from_text("");
+        let mut state = EditorState::new();
+        let dest = OutputDestination::File(PathBuf::from("test.rs"));
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
+        let mut closers = Vec::new();
+
+        handle_action(
+            Action::InsertChar('{'),
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut closers,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "{}");
+        assert_eq!(state.cursor(), LineCol::new(0, 1));
+
+        // Backspace inside '{}' deletes both brackets
+        handle_action(
+            Action::DeleteBackward,
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut closers,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "");
+        assert_eq!(state.cursor(), LineCol::new(0, 0));
+    }
+
+    #[test]
+    fn test_autopair_newline_bracket_expansion() {
+        let mut buffer = TextBuffer::from_text("");
+        let mut state = EditorState::new();
+        let dest = OutputDestination::File(PathBuf::from("test.rs"));
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
+        let mut closers = Vec::new();
+
+        handle_action(
+            Action::InsertChar('{'),
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut closers,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "{}");
+        assert_eq!(state.cursor(), LineCol::new(0, 1));
+
+        // Enter inside '{}' expands to block
+        handle_action(
+            Action::InsertNewline,
+            &mut buffer,
+            &mut state,
+            &dest,
+            &mut syntax,
+            &mut closers,
+        )
+        .unwrap();
+        assert_eq!(buffer.text(), "{\n    \n}");
+        assert_eq!(state.cursor(), LineCol::new(1, 4));
+    }
+
+    #[test]
+    fn test_semantic_codetag_highlighting() {
+        let text = "// TODO: implement this feature\n";
+        let syntax = SyntaxState::new(languages::RUST.unwrap(), text);
+        assert!(syntax.rendered_highlights.is_some());
+        let rendered = syntax.rendered_highlights.unwrap();
+        assert_ne!(rendered.all(), []);
     }
 
     #[test]
@@ -931,7 +1619,10 @@ mod tests {
         assert_eq!(file_type_for_path(Path::new("main.go")).name(), "Go");
         assert!(language_id_from_path(Path::new("main.go")).is_some());
 
-        assert_eq!(file_type_for_path(Path::new("README.md")).name(), "Markdown");
+        assert_eq!(
+            file_type_for_path(Path::new("README.md")).name(),
+            "Markdown"
+        );
         assert!(language_id_from_path(Path::new("README.md")).is_some());
     }
 
@@ -979,6 +1670,8 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
+            &mut None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
@@ -996,9 +1689,16 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
+            &mut None,
+            &mut Vec::new(),
         )
         .unwrap();
-        assert!(matches!(res, LoopControl::Continue { text_changed: false }));
+        assert!(matches!(
+            res,
+            LoopControl::Continue {
+                text_changed: false
+            }
+        ));
         assert!(in_confirm_discard);
 
         // While in confirm discard, pressing 'n' cancels confirmation
@@ -1008,9 +1708,16 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
+            &mut None,
+            &mut Vec::new(),
         )
         .unwrap();
-        assert!(matches!(res, LoopControl::Continue { text_changed: false }));
+        assert!(matches!(
+            res,
+            LoopControl::Continue {
+                text_changed: false
+            }
+        ));
         assert!(!in_confirm_discard);
 
         // Dirty Esc again -> confirm discard
@@ -1020,6 +1727,8 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
+            &mut None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(in_confirm_discard);
@@ -1031,6 +1740,8 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
+            &mut None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
@@ -1061,6 +1772,8 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
+            &mut None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::SUCCESS));
@@ -1084,6 +1797,8 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
+            &mut None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(res, LoopControl::AcceptStdout);

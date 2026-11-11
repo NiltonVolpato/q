@@ -26,7 +26,8 @@ pub enum Action {
     PageDown { extend: bool },
     SelectAll,
     InsertChar(char),
-    InsertTab,
+    Indent,
+    Dedent,
     InsertNewline,
     DeleteBackward,
     DeleteForward,
@@ -97,8 +98,11 @@ pub const fn map_key(key: KeyEvent, mode: EditorMode) -> Action {
         (_, false, false, _, KeyCode::PageUp) => Action::PageUp { extend: shift },
         (_, false, false, _, KeyCode::PageDown) => Action::PageDown { extend: shift },
 
-        // Typing / Inserting
-        (_, false, false, _, KeyCode::Tab) => Action::InsertTab,
+        // Tab & BackTab / Shift+Tab (Indent & Dedent)
+        (_, false, false, false, KeyCode::Tab) => Action::Indent,
+        (_, false, false, true, KeyCode::Tab) | (_, false, false, _, KeyCode::BackTab) => {
+            Action::Dedent
+        }
         (_, false, false, _, KeyCode::Char(c)) => Action::InsertChar(c),
 
         // Deleting
@@ -126,11 +130,17 @@ mod tests {
     #[test]
     fn test_prompt_mode_enter_and_shift_enter() {
         assert_eq!(
-            map_key(press(KeyCode::Enter, KeyModifiers::NONE), EditorMode::Prompt),
+            map_key(
+                press(KeyCode::Enter, KeyModifiers::NONE),
+                EditorMode::Prompt
+            ),
             Action::SaveAndAccept
         );
         assert_eq!(
-            map_key(press(KeyCode::Enter, KeyModifiers::SHIFT), EditorMode::Prompt),
+            map_key(
+                press(KeyCode::Enter, KeyModifiers::SHIFT),
+                EditorMode::Prompt
+            ),
             Action::InsertNewline
         );
         assert_eq!(
@@ -138,7 +148,10 @@ mod tests {
             Action::InsertNewline
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('j'), KeyModifiers::CONTROL), EditorMode::Prompt),
+            map_key(
+                press(KeyCode::Char('j'), KeyModifiers::CONTROL),
+                EditorMode::Prompt
+            ),
             Action::InsertNewline
         );
     }
@@ -146,15 +159,24 @@ mod tests {
     #[test]
     fn test_normal_mode_enter_and_save_quit() {
         assert_eq!(
-            map_key(press(KeyCode::Enter, KeyModifiers::NONE), EditorMode::Normal),
+            map_key(
+                press(KeyCode::Enter, KeyModifiers::NONE),
+                EditorMode::Normal
+            ),
             Action::InsertNewline
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('s'), KeyModifiers::CONTROL), EditorMode::Normal),
+            map_key(
+                press(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                EditorMode::Normal
+            ),
             Action::Save
         );
         assert_eq!(
-            map_key(press(KeyCode::Char('q'), KeyModifiers::CONTROL), EditorMode::Normal),
+            map_key(
+                press(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                EditorMode::Normal
+            ),
             Action::Quit
         );
     }
@@ -168,6 +190,32 @@ mod tests {
         assert_eq!(
             map_key(press(KeyCode::Esc, KeyModifiers::NONE), EditorMode::Prompt),
             Action::Abort
+        );
+    }
+
+    #[test]
+    fn test_tab_and_shift_tab_indent_dedent() {
+        assert_eq!(
+            map_key(press(KeyCode::Tab, KeyModifiers::NONE), EditorMode::Normal),
+            Action::Indent
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Tab, KeyModifiers::SHIFT), EditorMode::Normal),
+            Action::Dedent
+        );
+        assert_eq!(
+            map_key(
+                press(KeyCode::BackTab, KeyModifiers::NONE),
+                EditorMode::Normal
+            ),
+            Action::Dedent
+        );
+        assert_eq!(
+            map_key(
+                press(KeyCode::BackTab, KeyModifiers::SHIFT),
+                EditorMode::Normal
+            ),
+            Action::Dedent
         );
     }
 }

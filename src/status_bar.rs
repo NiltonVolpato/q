@@ -47,7 +47,9 @@ impl<'a> StatusBar<'a> {
             let warning_color = theme.role(ThemeRole::DiagnosticWarning).to_ratatui();
             Line::from(vec![Span::styled(
                 "Discard unsaved changes? (y/n)",
-                Style::default().fg(warning_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(warning_color)
+                    .add_modifier(Modifier::BOLD),
             )])
         } else {
             let left_text = match config.mode {
@@ -111,8 +113,8 @@ impl<'a> StatusBar<'a> {
 
     pub fn draw(self, frame: &mut Frame, area: Rect) {
         let right_width = self.right_width().min(area.width);
-        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)])
-            .split(area);
+        let cols =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
 
         frame.render_widget(Paragraph::new(self.left).style(self.bar_style), cols[0]);
         frame.render_widget(
