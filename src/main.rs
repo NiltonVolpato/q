@@ -9,19 +9,21 @@ use std::process::ExitCode;
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseButton,
-        MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent,
+        KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use karet_core::{FoldRegions, Highlights, LineCol, Range};
-use karet_editor::{Editor, EditorState, Fold, editing, resolve_folds};
+use karet_editor::{Editor, EditorState, Fold, Motion, editing, resolve_folds};
+use karet_filetype::file_type_for_path;
 use karet_syntax::Highlighter;
 use karet_text::TextBuffer;
 use karet_theme::Theme;
 use karet_treesitter::{
-    LanguageId, ParserPool, SyntaxTree, language_id_from_path, language_name_from_path,
+    LanguageId, ParserPool, SyntaxTree, language_id_from_path,
 };
 use keymap::{Action, EditorMode, map_key};
 use ratatui::{
@@ -132,6 +134,20 @@ impl SyntaxHighlighter {
     }
 }
 
+fn save_buffer(buffer: &mut TextBuffer, path: &std::path::Path) -> anyhow::Result<()> {
+    let result = if path.exists() {
+        buffer.save(path)
+    } else {
+        buffer.save_new(path)
+    };
+    result.map(|_| ()).map_err(|e| match e {
+        karet_text::TextError::Conflict => {
+            anyhow::anyhow!("conflict: file was modified externally on disk: {}", path.display())
+        }
+        other => anyhow::anyhow!("{other}"),
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuardStage {
     RawMode,
@@ -161,7 +177,14 @@ impl TerminalGuard {
             stage: GuardStage::RawMode,
         };
         let mut backend = CrosstermBackend::new(tty);
-        execute!(backend, EnableMouseCapture)?;
+        execute!(
+            backend,
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        )?;
         guard.stage = GuardStage::MouseCapture;
         let terminal = Terminal::with_options(
             backend,
@@ -202,10 +225,18 @@ impl Drop for TerminalGuard {
             GuardStage::MouseCapture | GuardStage::FullyInitialized
         ) {
             if let Some(terminal) = self.terminal.as_mut() {
-                let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+                let _ = execute!(
+                    terminal.backend_mut(),
+                    PopKeyboardEnhancementFlags,
+                    DisableMouseCapture
+                );
             } else if let Ok(tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
                 let mut backend = CrosstermBackend::new(tty);
-                let _ = execute!(backend, DisableMouseCapture);
+                let _ = execute!(
+                    backend,
+                    PopKeyboardEnhancementFlags,
+                    DisableMouseCapture
+                );
             }
         }
         if self.stage != GuardStage::Restored {
@@ -250,97 +281,27 @@ fn toggle_comment_on_current_line(
 }
 
 fn handle_motion_action(action: Action, buffer: &TextBuffer, state: &mut EditorState) -> bool {
-    match action {
-        Action::MoveLeft { extend } => {
-            state.move_left(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::MoveRight { extend } => {
-            state.move_right(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::MoveUp { extend } => {
-            state.move_up(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::MoveDown { extend } => {
-            state.move_down(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::MoveWordLeft { extend } => {
-            state.move_word_left(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::MoveWordRight { extend } => {
-            state.move_word_right(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::MoveLineStart { extend } => {
-            state.move_line_start(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::MoveLineEnd { extend } => {
-            state.move_line_end(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::MoveDocStart { extend } => {
-            state.move_doc_start(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::MoveDocEnd { extend } => {
-            state.move_doc_end(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::PageUp { extend } => {
-            state.page_up(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
-        Action::PageDown { extend } => {
-            state.page_down(buffer);
-            if !extend {
-                state.clear_selection();
-            }
-            true
-        }
+    let (motion, extend) = match action {
+        Action::MoveLeft { extend } => (Motion::Left, extend),
+        Action::MoveRight { extend } => (Motion::Right, extend),
+        Action::MoveUp { extend } => (Motion::Up, extend),
+        Action::MoveDown { extend } => (Motion::Down, extend),
+        Action::MoveWordLeft { extend } => (Motion::WordLeft, extend),
+        Action::MoveWordRight { extend } => (Motion::WordRight, extend),
+        Action::MoveLineStart { extend } => (Motion::LineStart, extend),
+        Action::MoveLineEnd { extend } => (Motion::LineEnd, extend),
+        Action::MoveDocStart { extend } => (Motion::DocStart, extend),
+        Action::MoveDocEnd { extend } => (Motion::DocEnd, extend),
+        Action::PageUp { extend } => (Motion::PageUp, extend),
+        Action::PageDown { extend } => (Motion::PageDown, extend),
         Action::SelectAll => {
             state.select_all(buffer);
-            true
+            return true;
         }
-        _ => false,
-    }
+        _ => return false,
+    };
+    state.move_carets(buffer, motion, extend);
+    true
 }
 
 fn handle_edit_action(
@@ -505,18 +466,20 @@ fn handle_mouse_event(
             }
         }
         MouseEventKind::ScrollDown => {
-            state.scroll_to_line(state.scroll_line.saturating_add(1));
+            state.scroll_to_line(state.scroll_line().saturating_add(1));
         }
         MouseEventKind::ScrollUp => {
-            state.scroll_to_line(state.scroll_line.saturating_sub(1));
+            state.scroll_to_line(state.scroll_line().saturating_sub(1));
         }
         _ => {}
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum LoopControl {
     Continue { text_changed: bool },
     Exit(ExitCode),
+    AcceptStdout,
 }
 
 fn handle_key_press(
@@ -565,7 +528,7 @@ fn handle_key_press(
         }
         Action::Save => {
             if let OutputDestination::File(path) = &cli_args.destination {
-                buffer.save(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+                save_buffer(buffer, path)?;
             }
             Ok(LoopControl::Continue {
                 text_changed: false,
@@ -574,15 +537,11 @@ fn handle_key_press(
         Action::SaveAndAccept => {
             match &cli_args.destination {
                 OutputDestination::File(path) => {
-                    buffer.save(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    save_buffer(buffer, path)?;
+                    Ok(LoopControl::Exit(ExitCode::SUCCESS))
                 }
-                OutputDestination::Stdout => {
-                    let mut stdout = std::io::stdout().lock();
-                    stdout.write_all(buffer.text().as_bytes())?;
-                    stdout.flush()?;
-                }
+                OutputDestination::Stdout => Ok(LoopControl::AcceptStdout),
             }
-            Ok(LoopControl::Exit(ExitCode::SUCCESS))
         }
         other => {
             let changed = handle_action(other, buffer, state)?;
@@ -623,7 +582,7 @@ fn render_editor(
     frame.render_stateful_widget(editor_widget, top, state);
 
     let total_lines = ctx.buffer.line_count();
-    let bottom_line = (state.scroll_line as usize).saturating_add(top.height as usize);
+    let bottom_line = (state.scroll_line() as usize).saturating_add(top.height as usize);
     let lines_below = total_lines.saturating_sub(bottom_line);
     let pct_below = (lines_below * 100)
         .checked_div(total_lines)
@@ -673,24 +632,31 @@ fn init_buffer(destination: &OutputDestination) -> anyhow::Result<(TextBuffer, S
             } else {
                 use std::io::Read as _;
 
-                let mut input = String::new();
-                std::io::stdin().read_to_string(&mut input)?;
-                Ok((TextBuffer::from_text(&input), "[stdin]".to_owned()))
+                let mut input = Vec::new();
+                std::io::stdin().read_to_end(&mut input)?;
+                let buf = TextBuffer::from_bytes(&input)
+                    .map_err(|e| anyhow::anyhow!("stdin error: {e}"))?;
+                Ok((buf, "[stdin]".to_owned()))
             }
         }
     }
 }
 
+enum EditorOutcome {
+    AcceptStdout(TextBuffer),
+    Exit(ExitCode),
+}
+
 fn run_editor_loop(
     guard: &mut TerminalGuard,
     cli_args: &CliArgs,
-) -> anyhow::Result<ExitCode> {
+) -> anyhow::Result<EditorOutcome> {
     let (mut buffer, file_name) = init_buffer(&cli_args.destination)?;
 
     let (lang_id, lang_name) = match &cli_args.destination {
         OutputDestination::File(path) => (
             language_id_from_path(path),
-            language_name_from_path(path).unwrap_or("Plain Text"),
+            file_type_for_path(path).name(),
         ),
         OutputDestination::Stdout => (None, "Plain Text"),
     };
@@ -745,7 +711,10 @@ fn run_editor_loop(
                         } => {
                             text_changed = changed;
                         }
-                        LoopControl::Exit(code) => return Ok(code),
+                        LoopControl::Exit(code) => return Ok(EditorOutcome::Exit(code)),
+                        LoopControl::AcceptStdout => {
+                            return Ok(EditorOutcome::AcceptStdout(buffer));
+                        }
                     }
                 }
                 Event::Mouse(mouse) if !in_confirm_discard => {
@@ -779,8 +748,20 @@ fn run() -> anyhow::Result<ExitCode> {
     };
 
     let mut guard = TerminalGuard::init(10)?;
-    let exit_code = run_editor_loop(&mut guard, &cli_args)?;
-    Ok(exit_code)
+    let outcome = run_editor_loop(&mut guard, &cli_args)?;
+    drop(guard);
+
+    match outcome {
+        EditorOutcome::AcceptStdout(buffer) => {
+            let mut stdout = std::io::stdout().lock();
+            for chunk in buffer.chunks() {
+                stdout.write_all(chunk.as_bytes())?;
+            }
+            stdout.flush()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        EditorOutcome::Exit(code) => Ok(code),
+    }
 }
 
 fn main() -> ExitCode {
@@ -938,28 +919,19 @@ mod tests {
 
     #[test]
     fn test_language_detection_for_multiple_languages() {
-        assert_eq!(language_name_from_path(Path::new("test.rs")), Some("Rust"));
+        assert_eq!(file_type_for_path(Path::new("test.rs")).name(), "Rust");
         assert!(language_id_from_path(Path::new("test.rs")).is_some());
 
-        assert_eq!(
-            language_name_from_path(Path::new("script.py")),
-            Some("Python")
-        );
+        assert_eq!(file_type_for_path(Path::new("script.py")).name(), "Python");
         assert!(language_id_from_path(Path::new("script.py")).is_some());
 
-        assert_eq!(
-            language_name_from_path(Path::new("app.js")),
-            Some("JavaScript")
-        );
+        assert_eq!(file_type_for_path(Path::new("app.js")).name(), "JavaScript");
         assert!(language_id_from_path(Path::new("app.js")).is_some());
 
-        assert_eq!(language_name_from_path(Path::new("main.go")), Some("Go"));
+        assert_eq!(file_type_for_path(Path::new("main.go")).name(), "Go");
         assert!(language_id_from_path(Path::new("main.go")).is_some());
 
-        assert_eq!(
-            language_name_from_path(Path::new("README.md")),
-            Some("Markdown")
-        );
+        assert_eq!(file_type_for_path(Path::new("README.md")).name(), "Markdown");
         assert!(language_id_from_path(Path::new("README.md")).is_some());
     }
 
@@ -1114,6 +1086,34 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::SUCCESS));
+        assert_eq!(res, LoopControl::AcceptStdout);
+    }
+
+    #[test]
+    fn test_stdout_chunk_streaming_parity() {
+        let content = "line 1\nline 2 with some words\nline 3\n";
+        let buffer = TextBuffer::from_text(content);
+        let mut out = Vec::new();
+        for chunk in buffer.chunks() {
+            out.extend_from_slice(chunk.as_bytes());
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), content);
+    }
+
+    #[test]
+    fn test_from_bytes_bom_and_crlf_detection() {
+        // Valid UTF-8 with BOM and CRLF
+        let mut raw = vec![0xEF, 0xBB, 0xBF];
+        raw.extend_from_slice(b"first line\r\nsecond line\r\n");
+        let buffer = TextBuffer::from_bytes(&raw).unwrap();
+        assert_eq!(buffer.encoding(), karet_text::Encoding::Utf8Bom);
+        assert_eq!(buffer.eol(), karet_text::Eol::Crlf);
+        assert_eq!(buffer.line_count(), 3);
+        assert_eq!(buffer.line(0).unwrap(), "first line");
+        assert_eq!(buffer.line(1).unwrap(), "second line");
+
+        // Invalid UTF-8 rejected
+        let invalid = [0xFF, 0xFE, 0xFD];
+        assert!(TextBuffer::from_bytes(&invalid).is_err());
     }
 }

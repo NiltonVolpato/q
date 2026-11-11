@@ -48,10 +48,12 @@ pub const fn map_key(key: KeyEvent, mode: EditorMode) -> Action {
         // Esc: Abort in both modes
         (_, false, false, _, KeyCode::Esc) => Action::Abort,
 
-        // Prompt Mode: Enter accepts, Shift+Enter inserts newline
+        // Prompt Mode: Enter accepts, Shift+Enter / Alt+Enter / Ctrl+J inserts newline
         (EditorMode::Prompt, false, false, false, KeyCode::Enter)
         | (EditorMode::Prompt, true, false, false, KeyCode::Char('s')) => Action::SaveAndAccept,
         (EditorMode::Prompt, false, false, true, KeyCode::Enter)
+        | (EditorMode::Prompt, false, true, false, KeyCode::Enter)
+        | (EditorMode::Prompt, true, false, false, KeyCode::Char('j'))
         | (EditorMode::Normal, false, false, _, KeyCode::Enter) => Action::InsertNewline,
 
         // Normal Mode: Ctrl+S saves, Ctrl+Q quits
@@ -129,6 +131,14 @@ mod tests {
         );
         assert_eq!(
             map_key(press(KeyCode::Enter, KeyModifiers::SHIFT), EditorMode::Prompt),
+            Action::InsertNewline
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Enter, KeyModifiers::ALT), EditorMode::Prompt),
+            Action::InsertNewline
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('j'), KeyModifiers::CONTROL), EditorMode::Prompt),
             Action::InsertNewline
         );
     }

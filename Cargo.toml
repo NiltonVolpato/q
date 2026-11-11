@@ -106,11 +106,21 @@ anyhow = "1.0.104"
 crossterm = "0.29.0"
 karet-core = "0.7.1"
 karet-editor = "0.7.1"
+karet-filetype = "0.7.1"
 karet-syntax = { version = "0.7.1" }
 karet-text = "0.7.1"
 karet-theme = "0.7.1"
 karet-treesitter = "0.7.1"
 ratatui = "0.30.2"
+
+[patch.crates-io]
+karet-core = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }
+karet-editor = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }
+karet-filetype = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }
+karet-syntax = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }
+karet-text = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }
+karet-theme = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }
+karet-treesitter = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
