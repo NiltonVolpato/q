@@ -4,10 +4,9 @@ use karet_core::{LineCol, Range, ThemeRole};
 use karet_theme::Theme;
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
 };
 
 use crate::keymap::EditorMode;
@@ -106,23 +105,13 @@ impl<'a> StatusBar<'a> {
         }
     }
 
-    #[must_use]
-    pub fn right_width(&self) -> u16 {
-        u16::try_from(self.right.width()).unwrap_or(u16::MAX)
-    }
-
     pub fn draw(self, frame: &mut Frame, area: Rect) {
-        let right_width = self.right_width().min(area.width);
-        let cols =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
-
-        frame.render_widget(Paragraph::new(self.left).style(self.bar_style), cols[0]);
-        frame.render_widget(
-            Paragraph::new(self.right)
-                .style(self.bar_style)
-                .alignment(Alignment::Right),
-            cols[1],
-        );
+        karet_widgets::status::StatusBar {
+            bar: self.bar_style,
+            left: self.left,
+            right: self.right,
+        }
+        .draw(frame, area);
     }
 }
 
@@ -192,5 +181,37 @@ mod tests {
         assert!(bar.left.to_string().contains("\u{238b}: Abort"));
         assert!(bar.left.to_string().contains("\u{2303}Z: Undo"));
         assert!(bar.right.to_string().contains("1:1 50%"));
+    }
+
+    #[test]
+    fn test_status_bar_draw_delegates_to_karet_widget() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        let theme = Theme::dark();
+        let config = StatusBarConfig {
+            cursor: LineCol::new(0, 0),
+            selection: None,
+            language: "Rust",
+            file_name: "main.rs",
+            is_dirty: false,
+            mode: EditorMode::Normal,
+            in_confirm_discard: false,
+            pct_below: 100,
+        };
+        let bar = StatusBar::new(&theme, &config);
+        terminal
+            .draw(|f| {
+                bar.draw(f, f.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // Left hint starts at column 0
+        assert_eq!(buffer[(0u16, 0u16)].symbol(), "\u{2303}");
+        // Right side contains "main.rs"
+        let rendered_line: String = (0..80).map(|x| buffer[(x, 0u16)].symbol()).collect();
+        assert!(rendered_line.contains("main.rs"));
+        assert!(rendered_line.contains("Rust"));
     }
 }

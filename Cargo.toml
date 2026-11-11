@@ -111,6 +111,7 @@ karet-syntax = { version = "0.7.1" }
 karet-text = "0.7.1"
 karet-theme = "0.7.1"
 karet-treesitter = "0.7.1"
+karet-widgets = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }
 ratatui = "0.30.2"
 
 [patch.crates-io]
