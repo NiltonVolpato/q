@@ -2,7 +2,8 @@ mod keymap;
 mod status_bar;
 
 use std::collections::BTreeSet;
-use std::io::{Stdout, stdout};
+use std::fs::File;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -31,16 +32,22 @@ use ratatui::{
 use status_bar::{StatusBar, StatusBarConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputDestination {
+    File(PathBuf),
+    Stdout,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliArgs {
     pub mode: EditorMode,
-    pub file_path: PathBuf,
+    pub destination: OutputDestination,
 }
 
 /// Parse CLI arguments.
 ///
 /// # Errors
 /// Returns an error if an unknown option is provided, if multiple files are provided,
-/// or if the required `<FILE>` argument is missing.
+/// or if no file is provided when not in prompt mode.
 fn parse_args<I, T>(args: I) -> anyhow::Result<Option<CliArgs>>
 where
     I: IntoIterator<Item = T>,
@@ -50,18 +57,18 @@ where
     let _program_name = args_iter.next();
 
     let mut mode = EditorMode::Normal;
-    let mut file_path: Option<PathBuf> = None;
+    let mut file_arg: Option<String> = None;
 
     for arg in args_iter {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
                     "qe - inline terminal editor\n\n\
-                     Usage: qe [OPTIONS] <FILE>\n\n\
+                     Usage: qe [OPTIONS] [FILE]\n\n\
                      Arguments:\n  \
-                       <FILE>  Path to file to edit or create\n\n\
+                       [FILE]  Path to file to edit or create (use - or omit for pipeline)\n\n\
                      Options:\n  \
-                       -p, --prompt  Prompt mode (Enter accepts, Shift+Enter newline, Esc aborts)\n  \
+                       -p, --prompt  Prompt mode (⏎ accepts, ⇧⏎ newline, ⎋ aborts)\n  \
                        -h, --help    Print help"
                 );
                 return Ok(None);
@@ -69,25 +76,33 @@ where
             "-p" | "--prompt" => {
                 mode = EditorMode::Prompt;
             }
-            arg if arg.starts_with('-') => {
+            arg if arg.starts_with('-') && arg != "-" => {
                 anyhow::bail!("unknown option '{arg}'. Use --help for usage information.");
             }
             _ => {
-                if file_path.is_some() {
+                if file_arg.is_some() {
                     anyhow::bail!(
                         "unexpected argument '{arg}'. Exactly one file argument is expected."
                     );
                 }
-                file_path = Some(PathBuf::from(arg));
+                file_arg = Some(arg);
             }
         }
     }
 
-    let file_path = file_path.ok_or_else(|| {
-        anyhow::anyhow!("missing required <FILE> argument. Usage: qe [OPTIONS] <FILE>")
-    })?;
+    let destination = match file_arg.as_deref() {
+        None | Some("-") => {
+            if mode != EditorMode::Prompt {
+                anyhow::bail!(
+                    "no file specified. To use qe as an interactive pipeline prompt, pass -p/--prompt."
+                );
+            }
+            OutputDestination::Stdout
+        }
+        Some(path_str) => OutputDestination::File(PathBuf::from(path_str)),
+    };
 
-    Ok(Some(CliArgs { mode, file_path }))
+    Ok(Some(CliArgs { mode, destination }))
 }
 
 struct SyntaxHighlighter {
@@ -126,22 +141,28 @@ enum GuardStage {
 }
 
 struct TerminalGuard {
-    terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
+    terminal: Option<Terminal<CrosstermBackend<File>>>,
     viewport_area: Option<Rect>,
     stage: GuardStage,
 }
 
 impl TerminalGuard {
     fn init(lines: u16) -> anyhow::Result<Self> {
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .map_err(|e| anyhow::anyhow!("failed to open /dev/tty: {e}"))?;
+
         enable_raw_mode()?;
         let mut guard = Self {
             terminal: None,
             viewport_area: None,
             stage: GuardStage::RawMode,
         };
-        execute!(stdout(), EnableMouseCapture)?;
+        let mut backend = CrosstermBackend::new(tty);
+        execute!(backend, EnableMouseCapture)?;
         guard.stage = GuardStage::MouseCapture;
-        let backend = CrosstermBackend::new(stdout());
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -153,7 +174,7 @@ impl TerminalGuard {
         Ok(guard)
     }
 
-    const fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+    const fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<File>> {
         self.terminal.as_mut().expect("terminal initialized")
     }
 
@@ -180,7 +201,12 @@ impl Drop for TerminalGuard {
             self.stage,
             GuardStage::MouseCapture | GuardStage::FullyInitialized
         ) {
-            let _ = execute!(stdout(), DisableMouseCapture);
+            if let Some(terminal) = self.terminal.as_mut() {
+                let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+            } else if let Ok(tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+                let mut backend = CrosstermBackend::new(tty);
+                let _ = execute!(backend, DisableMouseCapture);
+            }
         }
         if self.stage != GuardStage::Restored {
             let _ = disable_raw_mode();
@@ -538,17 +564,24 @@ fn handle_key_press(
             }
         }
         Action::Save => {
-            buffer
-                .save(&cli_args.file_path)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if let OutputDestination::File(path) = &cli_args.destination {
+                buffer.save(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
             Ok(LoopControl::Continue {
                 text_changed: false,
             })
         }
         Action::SaveAndAccept => {
-            buffer
-                .save(&cli_args.file_path)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            match &cli_args.destination {
+                OutputDestination::File(path) => {
+                    buffer.save(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                OutputDestination::Stdout => {
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(buffer.text().as_bytes())?;
+                    stdout.flush()?;
+                }
+            }
             Ok(LoopControl::Exit(ExitCode::SUCCESS))
         }
         other => {
@@ -616,25 +649,51 @@ fn render_editor(
     (area, top)
 }
 
+fn init_buffer(destination: &OutputDestination) -> anyhow::Result<(TextBuffer, String)> {
+    match destination {
+        OutputDestination::File(path) => {
+            if path.is_dir() {
+                anyhow::bail!("{}: Is a directory", path.display());
+            }
+            let buf = if path.exists() {
+                TextBuffer::load(path).map_err(|e| anyhow::anyhow!("{e}"))?
+            } else {
+                TextBuffer::from_text("")
+            };
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("untitled")
+                .to_owned();
+            Ok((buf, name))
+        }
+        OutputDestination::Stdout => {
+            if std::io::stdin().is_terminal() {
+                Ok((TextBuffer::from_text(""), "[prompt]".to_owned()))
+            } else {
+                use std::io::Read as _;
+
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                Ok((TextBuffer::from_text(&input), "[stdin]".to_owned()))
+            }
+        }
+    }
+}
+
 fn run_editor_loop(
     guard: &mut TerminalGuard,
     cli_args: &CliArgs,
 ) -> anyhow::Result<ExitCode> {
-    let mut buffer = if cli_args.file_path.exists() {
-        TextBuffer::load(&cli_args.file_path).map_err(|e| anyhow::anyhow!("{e}"))?
-    } else {
-        TextBuffer::from_text("")
+    let (mut buffer, file_name) = init_buffer(&cli_args.destination)?;
+
+    let (lang_id, lang_name) = match &cli_args.destination {
+        OutputDestination::File(path) => (
+            language_id_from_path(path),
+            language_name_from_path(path).unwrap_or("Plain Text"),
+        ),
+        OutputDestination::Stdout => (None, "Plain Text"),
     };
-
-    let file_name = cli_args
-        .file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("untitled")
-        .to_owned();
-
-    let lang_id = language_id_from_path(&cli_args.file_path);
-    let lang_name = language_name_from_path(&cli_args.file_path).unwrap_or("Plain Text");
     let mut syntax_highlighter = lang_id.and_then(SyntaxHighlighter::new);
 
     let mut state = EditorState::new();
@@ -719,10 +778,6 @@ fn run() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    if cli_args.file_path.is_dir() {
-        anyhow::bail!("{}: Is a directory", cli_args.file_path.display());
-    }
-
     let mut guard = TerminalGuard::init(10)?;
     let exit_code = run_editor_loop(&mut guard, &cli_args)?;
     Ok(exit_code)
@@ -803,20 +858,10 @@ mod tests {
         let mut buffer = TextBuffer::from_text("fn test() {}");
         let mut state = EditorState::new();
 
-        handle_action(
-            Action::ToggleComment,
-            &mut buffer,
-            &mut state,
-        )
-        .unwrap();
+        handle_action(Action::ToggleComment, &mut buffer, &mut state).unwrap();
         assert_eq!(buffer.text(), "// fn test() {}");
 
-        handle_action(
-            Action::ToggleComment,
-            &mut buffer,
-            &mut state,
-        )
-        .unwrap();
+        handle_action(Action::ToggleComment, &mut buffer, &mut state).unwrap();
         assert_eq!(buffer.text(), "fn test() {}");
     }
 
@@ -825,20 +870,42 @@ mod tests {
         let args = vec!["qe", "src/main.rs"];
         let parsed = parse_args(args).unwrap().unwrap();
         assert_eq!(parsed.mode, EditorMode::Normal);
-        assert_eq!(parsed.file_path, PathBuf::from("src/main.rs"));
+        assert_eq!(
+            parsed.destination,
+            OutputDestination::File(PathBuf::from("src/main.rs"))
+        );
     }
 
     #[test]
-    fn test_parse_args_prompt_mode() {
+    fn test_parse_args_prompt_mode_with_file() {
         let args = vec!["qe", "-p", "commit.txt"];
         let parsed = parse_args(args).unwrap().unwrap();
         assert_eq!(parsed.mode, EditorMode::Prompt);
-        assert_eq!(parsed.file_path, PathBuf::from("commit.txt"));
+        assert_eq!(
+            parsed.destination,
+            OutputDestination::File(PathBuf::from("commit.txt"))
+        );
+    }
 
-        let args_long = vec!["qe", "--prompt", "commit.txt"];
+    #[test]
+    fn test_parse_args_prompt_mode_stdout_no_file() {
+        let args = vec!["qe", "-p"];
+        let parsed = parse_args(args).unwrap().unwrap();
+        assert_eq!(parsed.mode, EditorMode::Prompt);
+        assert_eq!(parsed.destination, OutputDestination::Stdout);
+
+        let args_long = vec!["qe", "--prompt"];
         let parsed_long = parse_args(args_long).unwrap().unwrap();
         assert_eq!(parsed_long.mode, EditorMode::Prompt);
-        assert_eq!(parsed_long.file_path, PathBuf::from("commit.txt"));
+        assert_eq!(parsed_long.destination, OutputDestination::Stdout);
+    }
+
+    #[test]
+    fn test_parse_args_prompt_mode_stdout_explicit_dash() {
+        let args = vec!["qe", "-p", "-"];
+        let parsed = parse_args(args).unwrap().unwrap();
+        assert_eq!(parsed.mode, EditorMode::Prompt);
+        assert_eq!(parsed.destination, OutputDestination::Stdout);
     }
 
     #[test]
@@ -849,12 +916,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_args_missing_file_fails() {
+    fn test_parse_args_missing_file_without_prompt_fails() {
         let args = vec!["qe"];
         assert!(parse_args(args).is_err());
 
-        let args_p = vec!["qe", "-p"];
-        assert!(parse_args(args_p).is_err());
+        let args_dash = vec!["qe", "-"];
+        assert!(parse_args(args_dash).is_err());
     }
 
     #[test]
@@ -871,10 +938,7 @@ mod tests {
 
     #[test]
     fn test_language_detection_for_multiple_languages() {
-        assert_eq!(
-            language_name_from_path(Path::new("test.rs")),
-            Some("Rust")
-        );
+        assert_eq!(language_name_from_path(Path::new("test.rs")), Some("Rust"));
         assert!(language_id_from_path(Path::new("test.rs")).is_some());
 
         assert_eq!(
@@ -889,10 +953,7 @@ mod tests {
         );
         assert!(language_id_from_path(Path::new("app.js")).is_some());
 
-        assert_eq!(
-            language_name_from_path(Path::new("main.go")),
-            Some("Go")
-        );
+        assert_eq!(language_name_from_path(Path::new("main.go")), Some("Go"));
         assert!(language_id_from_path(Path::new("main.go")).is_some());
 
         assert_eq!(
@@ -933,7 +994,7 @@ mod tests {
     fn test_handle_key_press_abort_and_confirm_discard_flow() {
         let cli_args = CliArgs {
             mode: EditorMode::Normal,
-            file_path: PathBuf::from("test.txt"),
+            destination: OutputDestination::File(PathBuf::from("test.txt")),
         };
         let mut buffer = TextBuffer::from_text("clean text");
         let mut state = EditorState::new();
@@ -1004,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_key_press_prompt_mode_accept() {
+    fn test_handle_key_press_prompt_mode_accept_file() {
         let temp_dir = std::env::temp_dir();
         let temp_file = temp_dir.join(format!(
             "qe_prompt_test_{}.txt",
@@ -1015,7 +1076,7 @@ mod tests {
         ));
         let cli_args = CliArgs {
             mode: EditorMode::Prompt,
-            file_path: temp_file.clone(),
+            destination: OutputDestination::File(temp_file.clone()),
         };
         let mut buffer = TextBuffer::from_text("commit message");
         let mut state = EditorState::new();
@@ -1033,5 +1094,26 @@ mod tests {
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::SUCCESS));
         assert!(temp_file.exists());
         let _ = std::fs::remove_file(temp_file);
+    }
+
+    #[test]
+    fn test_handle_key_press_prompt_mode_accept_stdout() {
+        let cli_args = CliArgs {
+            mode: EditorMode::Prompt,
+            destination: OutputDestination::Stdout,
+        };
+        let mut buffer = TextBuffer::from_text("piped commit message");
+        let mut state = EditorState::new();
+        let mut in_confirm_discard = false;
+
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+            &mut in_confirm_discard,
+            &cli_args,
+            &mut buffer,
+            &mut state,
+        )
+        .unwrap();
+        assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::SUCCESS));
     }
 }
