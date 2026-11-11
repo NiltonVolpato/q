@@ -13,17 +13,20 @@ use ratatui::{
 use crate::keymap::EditorMode;
 
 const SEPARATOR: &str = " \u{b7} ";
+const CTRL: &str = "\u{2303}";
+const SHIFT: &str = "\u{21e7}";
+const ENTER: &str = "\u{23ce}";
+const ESC: &str = "\u{238b}";
 
 pub struct StatusBarConfig<'a> {
     pub cursor: LineCol,
     pub selection: Option<Range>,
     pub language: &'a str,
-    pub encoding: &'a str,
-    pub eol: &'a str,
     pub file_name: &'a str,
     pub is_dirty: bool,
     pub mode: EditorMode,
     pub in_confirm_discard: bool,
+    pub pct_below: u8,
 }
 
 pub struct StatusBar<'a> {
@@ -50,12 +53,12 @@ impl<'a> StatusBar<'a> {
             let left_text = match config.mode {
                 EditorMode::Prompt => {
                     format!(
-                        "Enter: Accept{SEPARATOR}Shift+Enter: Newline{SEPARATOR}Esc: Abort{SEPARATOR}^Z: Undo{SEPARATOR}^F: Fold"
+                        "{ENTER}: Accept{SEPARATOR}{SHIFT}{ENTER}: Newline{SEPARATOR}{ESC}: Abort{SEPARATOR}{CTRL}Z: Undo"
                     )
                 }
                 EditorMode::Normal => {
                     format!(
-                        "^S: Save{SEPARATOR}^Q: Quit{SEPARATOR}Esc: Abort{SEPARATOR}^Z: Undo{SEPARATOR}^F: Fold{SEPARATOR}^/: Comment"
+                        "{CTRL}S: Save{SEPARATOR}{CTRL}Q: Quit{SEPARATOR}{ESC}: Abort{SEPARATOR}{CTRL}Z: Undo"
                     )
                 }
             };
@@ -73,24 +76,21 @@ impl<'a> StatusBar<'a> {
         };
         right_segments.push(file_label);
 
-        // Cursor & selection
-        let mut cursor_label = format!("Ln {}, Col {}", config.cursor.line + 1, config.cursor.col + 1);
+        // Cursor, selection, and percentage below editor
+        let mut cursor_label = format!("{}:{}", config.cursor.line + 1, config.cursor.col + 1);
         if let Some(range) = config.selection
             && range.start != range.end
         {
             if range.start.line == range.end.line {
                 let count = range.end.col.abs_diff(range.start.col);
-                let _ = write!(cursor_label, " ({count} selected)");
+                let _ = write!(cursor_label, " ({count} sel)");
             } else {
                 let lines = range.end.line.abs_diff(range.start.line) + 1;
-                let _ = write!(cursor_label, " ({lines} lines selected)");
+                let _ = write!(cursor_label, " ({lines} lines)");
             }
         }
+        let _ = write!(cursor_label, " {}%", config.pct_below);
         right_segments.push(cursor_label);
-
-        // Encoding & EOL
-        right_segments.push(config.encoding.to_owned());
-        right_segments.push(config.eol.to_owned());
 
         // Language
         right_segments.push(config.language.to_owned());
@@ -138,19 +138,18 @@ mod tests {
                 end: LineCol::new(0, 5),
             }),
             language: "Rust",
-            encoding: "UTF-8",
-            eol: "LF",
             file_name: "test.rs",
             is_dirty: false,
             mode: EditorMode::Normal,
             in_confirm_discard: false,
+            pct_below: 80,
         };
         let bar = StatusBar::new(&theme, &config);
         assert!(bar.right.to_string().contains("test.rs"));
-        assert!(bar.right.to_string().contains("Ln 1, Col 6 (5 selected)"));
-        assert!(bar.right.to_string().contains("UTF-8"));
+        assert!(bar.right.to_string().contains("1:6 (5 sel) 80%"));
         assert!(bar.right.to_string().contains("Rust"));
-        assert!(bar.left.to_string().contains("^S: Save"));
+        assert!(bar.left.to_string().contains("\u{2303}S: Save"));
+        assert!(!bar.right.to_string().contains("UTF-8"));
     }
 
     #[test]
@@ -160,15 +159,15 @@ mod tests {
             cursor: LineCol::new(0, 0),
             selection: None,
             language: "Markdown",
-            encoding: "UTF-8",
-            eol: "LF",
             file_name: "note.md",
             is_dirty: true,
             mode: EditorMode::Prompt,
             in_confirm_discard: true,
+            pct_below: 0,
         };
         let bar = StatusBar::new(&theme, &config);
         assert!(bar.right.to_string().contains("note.md*"));
+        assert!(bar.right.to_string().contains("1:1 0%"));
         assert_eq!(bar.left.to_string(), "Discard unsaved changes? (y/n)");
     }
 
@@ -179,16 +178,17 @@ mod tests {
             cursor: LineCol::new(0, 0),
             selection: None,
             language: "Plain Text",
-            encoding: "UTF-8",
-            eol: "LF",
             file_name: "commit.txt",
             is_dirty: false,
             mode: EditorMode::Prompt,
             in_confirm_discard: false,
+            pct_below: 50,
         };
         let bar = StatusBar::new(&theme, &config);
-        assert!(bar.left.to_string().contains("Enter: Accept"));
-        assert!(bar.left.to_string().contains("Shift+Enter: Newline"));
-        assert!(bar.left.to_string().contains("Esc: Abort"));
+        assert!(bar.left.to_string().contains("\u{23ce}: Accept"));
+        assert!(bar.left.to_string().contains("\u{21e7}\u{23ce}: Newline"));
+        assert!(bar.left.to_string().contains("\u{238b}: Abort"));
+        assert!(bar.left.to_string().contains("\u{2303}Z: Undo"));
+        assert!(bar.right.to_string().contains("1:1 50%"));
     }
 }

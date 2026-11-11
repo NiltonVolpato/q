@@ -3,12 +3,110 @@ name = "qe"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = [
+    "lang-rust",
+    "lang-python",
+    "lang-javascript",
+    "lang-typescript",
+    "lang-json",
+    "lang-go",
+    "lang-c",
+    "lang-cpp",
+    "lang-java",
+    "lang-ruby",
+    "lang-bash",
+    "lang-toml",
+    "lang-html",
+    "lang-css",
+    "lang-yaml",
+    "lang-markdown",
+    "lang-latex",
+    "lang-zig",
+    "lang-xml",
+    "lang-protobuf",
+    "lang-make",
+    "lang-cmake",
+    "lang-rst",
+    "lang-zsh",
+    "lang-swift",
+    "lang-lua",
+    "lang-scss",
+    "lang-sass",
+    "lang-less",
+    "lang-json5",
+    "lang-ini",
+]
+
+all-languages = ["karet-syntax/all-languages"]
+lang-rust = ["karet-syntax/lang-rust"]
+lang-python = ["karet-syntax/lang-python"]
+lang-javascript = ["karet-syntax/lang-javascript"]
+lang-typescript = ["karet-syntax/lang-typescript"]
+lang-json = ["karet-syntax/lang-json"]
+lang-go = ["karet-syntax/lang-go"]
+lang-c = ["karet-syntax/lang-c"]
+lang-cpp = ["karet-syntax/lang-cpp"]
+lang-csharp = ["karet-syntax/lang-csharp"]
+lang-java = ["karet-syntax/lang-java"]
+lang-ruby = ["karet-syntax/lang-ruby"]
+lang-php = ["karet-syntax/lang-php"]
+lang-bash = ["karet-syntax/lang-bash"]
+lang-toml = ["karet-syntax/lang-toml"]
+lang-html = ["karet-syntax/lang-html"]
+lang-css = ["karet-syntax/lang-css"]
+lang-yaml = ["karet-syntax/lang-yaml"]
+lang-markdown = ["karet-syntax/lang-markdown"]
+lang-latex = ["karet-syntax/lang-latex"]
+lang-zig = ["karet-syntax/lang-zig"]
+lang-xml = ["karet-syntax/lang-xml"]
+lang-svelte = ["karet-syntax/lang-svelte"]
+lang-astro = ["karet-syntax/lang-astro"]
+lang-vue = ["karet-syntax/lang-vue"]
+lang-sql = ["karet-syntax/lang-sql"]
+lang-graphql = ["karet-syntax/lang-graphql"]
+lang-protobuf = ["karet-syntax/lang-protobuf"]
+lang-containerfile = ["karet-syntax/lang-containerfile"]
+lang-make = ["karet-syntax/lang-make"]
+lang-cmake = ["karet-syntax/lang-cmake"]
+lang-rst = ["karet-syntax/lang-rst"]
+lang-asciidoc = ["karet-syntax/lang-asciidoc"]
+lang-zsh = ["karet-syntax/lang-zsh"]
+lang-fish = ["karet-syntax/lang-fish"]
+lang-powershell = ["karet-syntax/lang-powershell"]
+lang-batch = ["karet-syntax/lang-batch"]
+lang-kotlin = ["karet-syntax/lang-kotlin"]
+lang-swift = ["karet-syntax/lang-swift"]
+lang-scala = ["karet-syntax/lang-scala"]
+lang-lua = ["karet-syntax/lang-lua"]
+lang-haskell = ["karet-syntax/lang-haskell"]
+lang-ocaml = ["karet-syntax/lang-ocaml"]
+lang-elixir = ["karet-syntax/lang-elixir"]
+lang-erlang = ["karet-syntax/lang-erlang"]
+lang-dart = ["karet-syntax/lang-dart"]
+lang-r = ["karet-syntax/lang-r"]
+lang-perl = ["karet-syntax/lang-perl"]
+lang-clojure = ["karet-syntax/lang-clojure"]
+lang-elisp = ["karet-syntax/lang-elisp"]
+lang-vim = ["karet-syntax/lang-vim"]
+lang-scss = ["karet-syntax/lang-scss"]
+lang-sass = ["karet-syntax/lang-sass"]
+lang-less = ["karet-syntax/lang-less"]
+lang-erb = ["karet-syntax/lang-erb"]
+lang-mdx = ["karet-syntax/lang-mdx"]
+lang-json5 = ["karet-syntax/lang-json5"]
+lang-ini = ["karet-syntax/lang-ini"]
+lang-properties = ["karet-syntax/lang-properties"]
+lang-edn = ["karet-syntax/lang-edn"]
+lang-cbor = ["karet-syntax/lang-cbor"]
+lang-lockfile = ["karet-syntax/lang-lockfile"]
+
 [dependencies]
 anyhow = "1.0.104"
 crossterm = "0.29.0"
 karet-core = "0.7.1"
 karet-editor = "0.7.1"
-karet-syntax = { version = "0.7.1", features = ["lang-rust"] }
+karet-syntax = { version = "0.7.1" }
 karet-text = "0.7.1"
 karet-theme = "0.7.1"
 karet-treesitter = "0.7.1"

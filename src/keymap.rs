@@ -33,7 +33,6 @@ pub enum Action {
     DeleteWordBackward,
     DeleteWordForward,
     ToggleComment,
-    ToggleFold,
     Undo,
     Redo,
     None,
@@ -66,9 +65,6 @@ pub const fn map_key(key: KeyEvent, mode: EditorMode) -> Action {
 
         // Select all
         (_, true, false, false, KeyCode::Char('a')) => Action::SelectAll,
-
-        // Folding
-        (_, true, false, false, KeyCode::Char('f')) => Action::ToggleFold,
 
         // Comments
         (_, true, false, false, KeyCode::Char('/' | '7')) => Action::ToggleComment,

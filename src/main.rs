@@ -17,7 +17,7 @@ use crossterm::{
 use karet_core::{FoldRegions, Highlights, LineCol, Range};
 use karet_editor::{Editor, EditorState, Fold, editing, resolve_folds};
 use karet_syntax::Highlighter;
-use karet_text::{Encoding, Eol, TextBuffer};
+use karet_text::TextBuffer;
 use karet_theme::Theme;
 use karet_treesitter::{
     LanguageId, ParserPool, SyntaxTree, language_id_from_path, language_name_from_path,
@@ -223,28 +223,6 @@ fn toggle_comment_on_current_line(
     Ok(())
 }
 
-fn toggle_fold_at_cursor(
-    folds: &FoldRegions,
-    folded: &mut BTreeSet<u32>,
-    state: &mut EditorState,
-    buffer: &TextBuffer,
-) {
-    let cursor_line = state.cursor().line;
-    if let Some(r) = folds
-        .regions()
-        .iter()
-        .rfind(|r| r.start <= cursor_line && cursor_line <= r.end)
-    {
-        let start = r.start;
-        if !folded.remove(&start) {
-            folded.insert(start);
-            if state.cursor().line > start {
-                state.goto(buffer, LineCol::new(start, 0));
-            }
-        }
-    }
-}
-
 fn handle_motion_action(action: Action, buffer: &TextBuffer, state: &mut EditorState) -> bool {
     match action {
         Action::MoveLeft { extend } => {
@@ -442,8 +420,6 @@ fn handle_action(
     action: Action,
     buffer: &mut TextBuffer,
     state: &mut EditorState,
-    folds: &FoldRegions,
-    folded: &mut BTreeSet<u32>,
 ) -> anyhow::Result<bool> {
     if handle_motion_action(action, buffer, state) {
         return Ok(false);
@@ -462,10 +438,6 @@ fn handle_action(
             } else {
                 Ok(false)
             }
-        }
-        Action::ToggleFold => {
-            toggle_fold_at_cursor(folds, folded, state, buffer);
-            Ok(false)
         }
         Action::ToggleComment => {
             toggle_comment_on_current_line(buffer, state)?;
@@ -527,8 +499,6 @@ fn handle_key_press(
     cli_args: &CliArgs,
     buffer: &mut TextBuffer,
     state: &mut EditorState,
-    folds: &FoldRegions,
-    folded: &mut BTreeSet<u32>,
 ) -> anyhow::Result<LoopControl> {
     if *in_confirm_discard {
         return Ok(match key.code {
@@ -582,7 +552,7 @@ fn handle_key_press(
             Ok(LoopControl::Exit(ExitCode::SUCCESS))
         }
         other => {
-            let changed = handle_action(other, buffer, state, folds, folded)?;
+            let changed = handle_action(other, buffer, state)?;
             Ok(LoopControl::Continue {
                 text_changed: changed,
             })
@@ -619,25 +589,23 @@ fn render_editor(
 
     frame.render_stateful_widget(editor_widget, top, state);
 
-    let eol_str = match ctx.buffer.eol() {
-        Eol::Lf => "LF",
-        Eol::Crlf => "CRLF",
-    };
-    let encoding_str = match ctx.buffer.encoding() {
-        Encoding::Utf8 => "UTF-8",
-        Encoding::Utf8Bom => "UTF-8 BOM",
-    };
+    let total_lines = ctx.buffer.line_count();
+    let bottom_line = (state.scroll_line as usize).saturating_add(top.height as usize);
+    let lines_below = total_lines.saturating_sub(bottom_line);
+    let pct_below = (lines_below * 100)
+        .checked_div(total_lines)
+        .and_then(|pct| u8::try_from(pct).ok())
+        .unwrap_or(0);
 
     let status_config = StatusBarConfig {
         cursor: state.cursor(),
         selection: state.selection_range(),
         language: ctx.lang_name,
-        encoding: encoding_str,
-        eol: eol_str,
         file_name: ctx.file_name,
         is_dirty: ctx.buffer.is_dirty(),
         mode: ctx.mode,
         in_confirm_discard: ctx.in_confirm_discard,
+        pct_below,
     };
     StatusBar::new(ctx.theme, &status_config).draw(frame, bottom);
 
@@ -712,8 +680,6 @@ fn run_editor_loop(
                         cli_args,
                         &mut buffer,
                         &mut state,
-                        &folds,
-                        &mut folded,
                     )? {
                         LoopControl::Continue {
                             text_changed: changed,
@@ -774,6 +740,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -798,15 +766,11 @@ mod tests {
     fn test_cursor_move_without_extend_clears_selection() {
         let mut buffer = TextBuffer::from_text("line 1\nline 2");
         let mut state = EditorState::new();
-        let folds = FoldRegions::default();
-        let mut folded = BTreeSet::new();
 
         let changed = handle_action(
             Action::MoveRight { extend: false },
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
 
@@ -820,15 +784,11 @@ mod tests {
     fn test_cursor_move_with_extend_creates_selection() {
         let mut buffer = TextBuffer::from_text("line 1\nline 2");
         let mut state = EditorState::new();
-        let folds = FoldRegions::default();
-        let mut folded = BTreeSet::new();
 
         handle_action(
             Action::MoveRight { extend: true },
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
 
@@ -842,15 +802,11 @@ mod tests {
     fn test_toggle_comment() {
         let mut buffer = TextBuffer::from_text("fn test() {}");
         let mut state = EditorState::new();
-        let folds = FoldRegions::default();
-        let mut folded = BTreeSet::new();
 
         handle_action(
             Action::ToggleComment,
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
         assert_eq!(buffer.text(), "// fn test() {}");
@@ -859,8 +815,6 @@ mod tests {
             Action::ToggleComment,
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
         assert_eq!(buffer.text(), "fn test() {}");
@@ -916,6 +870,39 @@ mod tests {
     }
 
     #[test]
+    fn test_language_detection_for_multiple_languages() {
+        assert_eq!(
+            language_name_from_path(Path::new("test.rs")),
+            Some("Rust")
+        );
+        assert!(language_id_from_path(Path::new("test.rs")).is_some());
+
+        assert_eq!(
+            language_name_from_path(Path::new("script.py")),
+            Some("Python")
+        );
+        assert!(language_id_from_path(Path::new("script.py")).is_some());
+
+        assert_eq!(
+            language_name_from_path(Path::new("app.js")),
+            Some("JavaScript")
+        );
+        assert!(language_id_from_path(Path::new("app.js")).is_some());
+
+        assert_eq!(
+            language_name_from_path(Path::new("main.go")),
+            Some("Go")
+        );
+        assert!(language_id_from_path(Path::new("main.go")).is_some());
+
+        assert_eq!(
+            language_name_from_path(Path::new("README.md")),
+            Some("Markdown")
+        );
+        assert!(language_id_from_path(Path::new("README.md")).is_some());
+    }
+
+    #[test]
     fn test_new_file_save_and_dirty_lifecycle() {
         let temp_dir = std::env::temp_dir();
         let temp_file = temp_dir.join(format!(
@@ -950,8 +937,6 @@ mod tests {
         };
         let mut buffer = TextBuffer::from_text("clean text");
         let mut state = EditorState::new();
-        let folds = FoldRegions::default();
-        let mut folded = BTreeSet::new();
         let mut in_confirm_discard = false;
 
         // Clean Esc: exits immediately with code 1
@@ -961,8 +946,6 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
@@ -980,8 +963,6 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Continue { text_changed: false }));
@@ -994,8 +975,6 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Continue { text_changed: false }));
@@ -1008,8 +987,6 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
         assert!(in_confirm_discard);
@@ -1021,8 +998,6 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
@@ -1044,8 +1019,6 @@ mod tests {
         };
         let mut buffer = TextBuffer::from_text("commit message");
         let mut state = EditorState::new();
-        let folds = FoldRegions::default();
-        let mut folded = BTreeSet::new();
         let mut in_confirm_discard = false;
 
         // In prompt mode, Enter saves and accepts with code 0
@@ -1055,8 +1028,6 @@ mod tests {
             &cli_args,
             &mut buffer,
             &mut state,
-            &folds,
-            &mut folded,
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::SUCCESS));
