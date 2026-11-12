@@ -279,6 +279,7 @@ pub(crate) fn render_editor(
         .folds(ctx.resolved_folds)
         .decorations(ctx.decorations)
         .read_only(ctx.mode == EditorMode::View)
+        .word_wrap(true)
         .focused(true);
     if let Some(h) = ctx.highlights {
         editor_widget = editor_widget.highlights(h);
@@ -626,6 +627,7 @@ fn render_query(
         .theme(ctx.theme)
         .folds(ctx.preview_folds)
         .read_only(true)
+        .word_wrap(true)
         .focused(ctx.focus == QueryFocus::Output);
     if let Some(h) = ctx.preview_highlights {
         preview_widget = preview_widget.highlights(h);
@@ -648,6 +650,7 @@ fn render_query(
 
     let query_widget = Editor::new(ctx.query_buf)
         .theme(ctx.theme)
+        .word_wrap(true)
         .focused(ctx.focus == QueryFocus::Query);
     frame.render_stateful_widget(query_widget, mid_editor, query_state);
 
