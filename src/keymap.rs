@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum EditorMode {
     Normal,
     Prompt,
+    View,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +37,11 @@ pub enum Action {
     ToggleComment,
     Undo,
     Redo,
+    ScrollUp(u32),
+    ScrollDown(u32),
+    StartSearch,
+    SearchNext,
+    SearchPrev,
     None,
 }
 
@@ -45,9 +51,16 @@ pub const fn map_key(key: KeyEvent, mode: EditorMode) -> Action {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    if matches!(mode, EditorMode::View) {
+        return map_view_key(key.code, ctrl, alt, shift);
+    }
+
     match (mode, ctrl, alt, shift, key.code) {
         // Esc: Abort in both modes
         (_, false, false, _, KeyCode::Esc) => Action::Abort,
+
+        // Search
+        (_, true, false, false, KeyCode::Char('f')) => Action::StartSearch,
 
         // Prompt Mode: Enter accepts, Shift+Enter / Alt+Enter / Ctrl+J inserts newline
         (EditorMode::Prompt, false, false, false, KeyCode::Enter)
@@ -114,6 +127,46 @@ pub const fn map_key(key: KeyEvent, mode: EditorMode) -> Action {
         (_, true, false, _, KeyCode::Delete) | (_, false, true, _, KeyCode::Delete) => {
             Action::DeleteWordForward
         }
+
+        _ => Action::None,
+    }
+}
+
+const fn map_view_key(code: KeyCode, ctrl: bool, alt: bool, shift: bool) -> Action {
+    match (ctrl, alt, shift, code) {
+        (false, false, _, KeyCode::Esc | KeyCode::Char('q'))
+        | (true, false, false, KeyCode::Char('q')) => Action::Quit,
+
+        (false, false, _, KeyCode::Char('j') | KeyCode::Down)
+        | (false, false, false, KeyCode::Enter) => Action::ScrollDown(1),
+        (false, false, _, KeyCode::Char('k') | KeyCode::Up) => Action::ScrollUp(1),
+
+        (false, false, _, KeyCode::Char(' ' | 'f') | KeyCode::PageDown) => {
+            Action::PageDown { extend: false }
+        }
+        (false, false, _, KeyCode::Char('b') | KeyCode::PageUp) => {
+            Action::PageUp { extend: false }
+        }
+        (false, false, _, KeyCode::Char('d')) | (true, false, false, KeyCode::Char('d')) => {
+            Action::ScrollDown(10)
+        }
+        (false, false, _, KeyCode::Char('u')) | (true, false, false, KeyCode::Char('u')) => {
+            Action::ScrollUp(10)
+        }
+
+        (false, false, _, KeyCode::Char('g') | KeyCode::Home) => {
+            Action::MoveDocStart { extend: false }
+        }
+        (false, false, _, KeyCode::Char('G') | KeyCode::End) => {
+            Action::MoveDocEnd { extend: false }
+        }
+
+        (false, false, _, KeyCode::Char('/')) | (true, false, false, KeyCode::Char('f')) => {
+            Action::StartSearch
+        }
+        (false, false, false, KeyCode::Char('n')) => Action::SearchNext,
+        (false, false, true, KeyCode::Char('n' | 'N'))
+        | (false, false, false, KeyCode::Char('N')) => Action::SearchPrev,
 
         _ => Action::None,
     }
@@ -216,6 +269,53 @@ mod tests {
                 EditorMode::Normal
             ),
             Action::Dedent
+        );
+    }
+
+    #[test]
+    fn test_view_mode_navigation_and_search() {
+        assert_eq!(
+            map_key(press(KeyCode::Char('q'), KeyModifiers::NONE), EditorMode::View),
+            Action::Quit
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Esc, KeyModifiers::NONE), EditorMode::View),
+            Action::Quit
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('j'), KeyModifiers::NONE), EditorMode::View),
+            Action::ScrollDown(1)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('k'), KeyModifiers::NONE), EditorMode::View),
+            Action::ScrollUp(1)
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char(' '), KeyModifiers::NONE), EditorMode::View),
+            Action::PageDown { extend: false }
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('b'), KeyModifiers::NONE), EditorMode::View),
+            Action::PageUp { extend: false }
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('/'), KeyModifiers::NONE), EditorMode::View),
+            Action::StartSearch
+        );
+        assert_eq!(
+            map_key(
+                press(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                EditorMode::View
+            ),
+            Action::StartSearch
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('n'), KeyModifiers::NONE), EditorMode::View),
+            Action::SearchNext
+        );
+        assert_eq!(
+            map_key(press(KeyCode::Char('N'), KeyModifiers::SHIFT), EditorMode::View),
+            Action::SearchPrev
         );
     }
 }

@@ -357,15 +357,18 @@ mod tests {
         let folds = syntax.map_or(&empty_folds, |syn| &syn.folds);
         let resolved_folds = resolve_folds(folds, folded);
 
+        let search = crate::search::SearchState::default();
         let render_ctx = RenderContext {
             buffer,
             theme: &theme,
             resolved_folds: &resolved_folds,
             highlights: syntax.and_then(|syn| syn.rendered_highlights.as_ref()),
+            decorations: &[],
             lang_name: "Rust",
             file_name: "test.rs",
             mode: EditorMode::Normal,
             in_confirm_discard: false,
+            search: &search,
         };
 
         let mut view_area = Rect::default();

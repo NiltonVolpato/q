@@ -15,6 +15,7 @@ pub enum OutputDestination {
 pub struct CliArgs {
     pub mode: EditorMode,
     pub destination: OutputDestination,
+    pub language: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -30,6 +31,8 @@ enum Command {
     Edit(EditArgs),
     /// Prompt mode (⏎ accepts, ⇧⏎ newline, ⎋ aborts)
     Prompt(PromptArgs),
+    /// View a file or stdin in read-only pager mode
+    View(ViewArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -46,14 +49,26 @@ struct PromptArgs {
     file: Option<String>,
 }
 
+#[derive(Parser, Debug)]
+#[command(about = "View a file or stdin in read-only pager mode")]
+struct ViewArgs {
+    /// Path to file to view, or omit / '-' for stdin
+    file: Option<String>,
+
+    /// Language name or extension for syntax highlighting (e.g. rust, py, json)
+    #[arg(short, long, value_name = "LANG")]
+    language: Option<String>,
+}
+
 impl EditArgs {
     fn into_cli_args(self) -> anyhow::Result<CliArgs> {
         if self.file.as_os_str() == "-" {
-            anyhow::bail!("'-' is only supported in prompt mode.");
+            anyhow::bail!("'-' is only supported in prompt or view mode.");
         }
         Ok(CliArgs {
             mode: EditorMode::Normal,
             destination: OutputDestination::File(self.file),
+            language: None,
         })
     }
 }
@@ -67,6 +82,21 @@ impl PromptArgs {
         CliArgs {
             mode: EditorMode::Prompt,
             destination,
+            language: None,
+        }
+    }
+}
+
+impl ViewArgs {
+    fn into_cli_args(self) -> CliArgs {
+        let destination = match self.file.as_deref() {
+            None | Some("-") => OutputDestination::Stdout,
+            Some(path) => OutputDestination::File(PathBuf::from(path)),
+        };
+        CliArgs {
+            mode: EditorMode::View,
+            destination,
+            language: self.language,
         }
     }
 }
@@ -131,6 +161,13 @@ where
             };
             Ok(Some(edit_args.into_cli_args()?))
         }
+        "qv" => {
+            let Some(view_args) = handle_clap_result(parse_alias::<ViewArgs>("qv", args_iter))?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(view_args.into_cli_args()))
+        }
         _ => {
             let full_args = std::iter::once(program).chain(args_iter);
             let Some(cli) = handle_clap_result(Cli::try_parse_from(full_args))? else {
@@ -139,6 +176,7 @@ where
             match cli.command {
                 Command::Edit(edit_args) => Ok(Some(edit_args.into_cli_args()?)),
                 Command::Prompt(prompt_args) => Ok(Some(prompt_args.into_cli_args())),
+                Command::View(view_args) => Ok(Some(view_args.into_cli_args())),
             }
         }
     }
@@ -212,6 +250,29 @@ mod tests {
     }
 
     #[test]
+    fn test_q_view_and_qv_alias() {
+        let parsed = parse_args(["q", "view", "src/main.rs"]).unwrap().unwrap();
+        assert_eq!(parsed.mode, EditorMode::View);
+        assert_eq!(
+            parsed.destination,
+            OutputDestination::File(PathBuf::from("src/main.rs"))
+        );
+        assert_eq!(parsed.language, None);
+
+        let parsed_stdin = parse_args(["qv", "-l", "rust"]).unwrap().unwrap();
+        assert_eq!(parsed_stdin.mode, EditorMode::View);
+        assert_eq!(parsed_stdin.destination, OutputDestination::Stdout);
+        assert_eq!(parsed_stdin.language.as_deref(), Some("rust"));
+
+        let parsed_dash = parse_args(["/usr/local/bin/qv", "-", "--language", "py"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed_dash.mode, EditorMode::View);
+        assert_eq!(parsed_dash.destination, OutputDestination::Stdout);
+        assert_eq!(parsed_dash.language.as_deref(), Some("py"));
+    }
+
+    #[test]
     fn test_help_and_no_args() {
         assert!(parse_args(["q"]).unwrap().is_none());
         assert!(parse_args(["q", "--help"]).unwrap().is_none());
@@ -219,8 +280,10 @@ mod tests {
         assert!(parse_args(["q", "help", "edit"]).unwrap().is_none());
         assert!(parse_args(["q", "edit", "--help"]).unwrap().is_none());
         assert!(parse_args(["q", "prompt", "--help"]).unwrap().is_none());
+        assert!(parse_args(["q", "view", "--help"]).unwrap().is_none());
         assert!(parse_args(["qe", "--help"]).unwrap().is_none());
         assert!(parse_args(["qp", "--help"]).unwrap().is_none());
+        assert!(parse_args(["qv", "--help"]).unwrap().is_none());
     }
 
     #[test]

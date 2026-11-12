@@ -2,28 +2,30 @@ mod args;
 mod editing;
 mod keymap;
 mod mouse;
+mod search;
 mod status_bar;
 mod syntax;
 mod terminal;
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use args::{CliArgs, OutputDestination, parse_args};
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use editing::handle_action;
-use karet_core::{FoldRegions, Highlights, LineCol};
+use karet_core::{Decoration, FoldRegions, Highlights, LineCol};
 use karet_editor::{Editor, EditorState, Fold, resolve_folds};
 use karet_filetype::file_type_for_path;
 use karet_syntax::fold_by_indent;
 use karet_text::TextBuffer;
 use karet_theme::Theme;
-use karet_treesitter::language_id_from_path;
+use karet_treesitter::{LanguageId, language_id_from_injection_name, language_id_from_path};
 use keymap::{Action, EditorMode, map_key};
 use mouse::{ClickTracker, EditorDrag, MouseContext, handle_drag_autoscroll, handle_mouse_event};
 use ratatui::layout::{Position, Rect};
+use search::SearchState;
 use status_bar::{StatusBar, StatusBarConfig};
 use syntax::SyntaxState;
 use terminal::{TerminalGuard, split_viewport};
@@ -52,20 +54,79 @@ enum LoopControl {
     AcceptStdout,
 }
 
-fn handle_key_press(
+fn handle_search_key(
     key: KeyEvent,
-    in_confirm_discard: &mut bool,
-    cli_args: &CliArgs,
-    buffer: &mut TextBuffer,
+    buffer: &TextBuffer,
     state: &mut EditorState,
-    syntax_state: &mut Option<SyntaxState>,
-    auto_closers: &mut Vec<LineCol>,
-) -> anyhow::Result<LoopControl> {
-    if *in_confirm_discard {
+    search: &mut SearchState,
+) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match key.code {
+        KeyCode::Esc => {
+            search.close();
+            search.query.clear();
+            search.matches.clear();
+            search.current = None;
+        }
+        KeyCode::Enter => {
+            search.close();
+        }
+        KeyCode::Down => {
+            if let Some(range) = search.next() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Up => {
+            if let Some(range) = search.prev() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Char('n') if ctrl => {
+            if let Some(range) = search.next() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Char('p') if ctrl => {
+            if let Some(range) = search.prev() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Backspace => {
+            search.query.pop();
+            search.update_matches(buffer, state.scroll_line());
+            if let Some(range) = search.current_range() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            search.query.push(c);
+            search.update_matches(buffer, state.scroll_line());
+            if let Some(range) = search.current_range() {
+                state.center_on(range.start.line);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct KeyContext<'a> {
+    in_confirm_discard: &'a mut bool,
+    cli_args: &'a CliArgs,
+    buffer: &'a mut TextBuffer,
+    state: &'a mut EditorState,
+    syntax_state: &'a mut Option<SyntaxState>,
+    auto_closers: &'a mut Vec<LineCol>,
+    search: &'a mut SearchState,
+}
+
+fn handle_key_press(key: KeyEvent, ctx: &mut KeyContext<'_>) -> anyhow::Result<LoopControl> {
+    if *ctx.in_confirm_discard {
         return Ok(match key.code {
             KeyCode::Char('y' | 'Y') => LoopControl::Exit(ExitCode::from(1)),
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                *in_confirm_discard = false;
+                *ctx.in_confirm_discard = false;
                 LoopControl::Continue {
                     text_changed: false,
                 }
@@ -76,11 +137,18 @@ fn handle_key_press(
         });
     }
 
-    let action = map_key(key, cli_args.mode);
+    if ctx.search.active {
+        handle_search_key(key, ctx.buffer, ctx.state, ctx.search);
+        return Ok(LoopControl::Continue {
+            text_changed: false,
+        });
+    }
+
+    let action = map_key(key, ctx.cli_args.mode);
     match action {
         Action::Abort => {
-            if buffer.is_dirty() {
-                *in_confirm_discard = true;
+            if ctx.buffer.is_dirty() {
+                *ctx.in_confirm_discard = true;
                 Ok(LoopControl::Continue {
                     text_changed: false,
                 })
@@ -89,8 +157,8 @@ fn handle_key_press(
             }
         }
         Action::Quit => {
-            if buffer.is_dirty() {
-                *in_confirm_discard = true;
+            if ctx.buffer.is_dirty() {
+                *ctx.in_confirm_discard = true;
                 Ok(LoopControl::Continue {
                     text_changed: false,
                 })
@@ -99,28 +167,49 @@ fn handle_key_press(
             }
         }
         Action::Save => {
-            if let OutputDestination::File(path) = &cli_args.destination {
-                save_buffer(buffer, path)?;
+            if let OutputDestination::File(path) = &ctx.cli_args.destination {
+                save_buffer(ctx.buffer, path)?;
             }
             Ok(LoopControl::Continue {
                 text_changed: false,
             })
         }
-        Action::SaveAndAccept => match &cli_args.destination {
+        Action::SaveAndAccept => match &ctx.cli_args.destination {
             OutputDestination::File(path) => {
-                save_buffer(buffer, path)?;
+                save_buffer(ctx.buffer, path)?;
                 Ok(LoopControl::Exit(ExitCode::SUCCESS))
             }
             OutputDestination::Stdout => Ok(LoopControl::AcceptStdout),
         },
+        Action::StartSearch
+        | Action::SearchNext
+        | Action::SearchPrev
+        | Action::ScrollUp(_)
+        | Action::ScrollDown(_) => {
+            handle_view_or_search_action(action, ctx.buffer, ctx.state, ctx.search);
+            Ok(LoopControl::Continue {
+                text_changed: false,
+            })
+        }
+        Action::PageDown { .. }
+        | Action::PageUp { .. }
+        | Action::MoveDocStart { .. }
+        | Action::MoveDocEnd { .. }
+            if ctx.cli_args.mode == EditorMode::View =>
+        {
+            handle_view_or_search_action(action, ctx.buffer, ctx.state, ctx.search);
+            Ok(LoopControl::Continue {
+                text_changed: false,
+            })
+        }
         other => {
             let changed = handle_action(
                 other,
-                buffer,
-                state,
-                &cli_args.destination,
-                syntax_state,
-                auto_closers,
+                ctx.buffer,
+                ctx.state,
+                &ctx.cli_args.destination,
+                ctx.syntax_state,
+                ctx.auto_closers,
             )?;
             Ok(LoopControl::Continue {
                 text_changed: changed,
@@ -129,15 +218,48 @@ fn handle_key_press(
     }
 }
 
+fn handle_view_or_search_action(
+    action: Action,
+    buffer: &TextBuffer,
+    state: &mut EditorState,
+    search: &mut SearchState,
+) {
+    match action {
+        Action::StartSearch => search.open(),
+        Action::SearchNext => {
+            if let Some(range) = search.next() {
+                state.center_on(range.start.line);
+            }
+        }
+        Action::SearchPrev => {
+            if let Some(range) = search.prev() {
+                state.center_on(range.start.line);
+            }
+        }
+        Action::ScrollUp(n) => state.scroll_to_line(state.scroll_line().saturating_sub(n)),
+        Action::ScrollDown(n) => state.scroll_to_line(state.scroll_line().saturating_add(n)),
+        Action::PageDown { .. } => state.scroll_page_down(),
+        Action::PageUp { .. } => state.scroll_page_up(),
+        Action::MoveDocStart { .. } => state.scroll_to_line(0),
+        Action::MoveDocEnd { .. } => {
+            let last_line = u32::try_from(buffer.line_count().saturating_sub(1)).unwrap_or(u32::MAX);
+            state.center_on(last_line);
+        }
+        _ => {}
+    }
+}
+
 pub(crate) struct RenderContext<'a> {
     pub(crate) buffer: &'a TextBuffer,
     pub(crate) theme: &'a Theme,
     pub(crate) resolved_folds: &'a [Fold],
     pub(crate) highlights: Option<&'a Highlights>,
+    pub(crate) decorations: &'a [Decoration],
     pub(crate) lang_name: &'a str,
     pub(crate) file_name: &'a str,
     pub(crate) mode: EditorMode,
     pub(crate) in_confirm_discard: bool,
+    pub(crate) search: &'a SearchState,
 }
 
 pub(crate) fn render_editor(
@@ -151,6 +273,8 @@ pub(crate) fn render_editor(
     let mut editor_widget = Editor::new(ctx.buffer)
         .theme(ctx.theme)
         .folds(ctx.resolved_folds)
+        .decorations(ctx.decorations)
+        .read_only(ctx.mode == EditorMode::View)
         .focused(true);
     if let Some(h) = ctx.highlights {
         editor_widget = editor_widget.highlights(h);
@@ -175,17 +299,28 @@ pub(crate) fn render_editor(
         mode: ctx.mode,
         in_confirm_discard: ctx.in_confirm_discard,
         pct_below,
+        search: Some(ctx.search),
     };
     StatusBar::new(ctx.theme, &status_config).draw(frame, bottom);
 
-    if let Some((x, y)) = state.primary_caret_cell(top, ctx.buffer, ctx.resolved_folds) {
+    if ctx.search.active {
+        let query_len = u16::try_from(ctx.search.query.chars().count()).unwrap_or(u16::MAX);
+        let max_x = bottom.right().saturating_sub(1);
+        let cursor_x = bottom.x.saturating_add(1).saturating_add(query_len).min(max_x);
+        frame.set_cursor_position(Position::new(cursor_x, bottom.y));
+    } else if ctx.mode != EditorMode::View
+        && let Some((x, y)) = state.primary_caret_cell(top, ctx.buffer, ctx.resolved_folds)
+    {
         frame.set_cursor_position(Position::new(x, y));
     }
 
     (area, top)
 }
 
-fn init_buffer(destination: &OutputDestination) -> anyhow::Result<(TextBuffer, String)> {
+fn init_buffer(
+    destination: &OutputDestination,
+    mode: EditorMode,
+) -> anyhow::Result<(TextBuffer, String)> {
     match destination {
         OutputDestination::File(path) => {
             let name = path
@@ -205,6 +340,9 @@ fn init_buffer(destination: &OutputDestination) -> anyhow::Result<(TextBuffer, S
             use std::io::IsTerminal as _;
 
             if std::io::stdin().is_terminal() {
+                if mode == EditorMode::View {
+                    anyhow::bail!("no file specified and stdin is a terminal.");
+                }
                 Ok((TextBuffer::from_text(""), "[prompt]".to_owned()))
             } else {
                 use std::io::Read as _;
@@ -219,20 +357,35 @@ fn init_buffer(destination: &OutputDestination) -> anyhow::Result<(TextBuffer, S
     }
 }
 
+fn resolve_language(cli_args: &CliArgs) -> (Option<LanguageId>, &'static str) {
+    if let Some(lang) = cli_args.language.as_deref() {
+        let dummy = PathBuf::from(format!("file.{lang}"));
+        let lang_id =
+            language_id_from_injection_name(lang).or_else(|| language_id_from_path(&dummy));
+        let ft = file_type_for_path(&dummy);
+        let lang_name = if ft.is_recognized() {
+            ft.name()
+        } else {
+            "Plain Text"
+        };
+        return (lang_id, lang_name);
+    }
+    match &cli_args.destination {
+        OutputDestination::File(path) => {
+            (language_id_from_path(path), file_type_for_path(path).name())
+        }
+        OutputDestination::Stdout => (None, "Plain Text"),
+    }
+}
+
 enum EditorOutcome {
     AcceptStdout(TextBuffer),
     Exit(ExitCode),
 }
 
 fn run_editor_loop(guard: &mut TerminalGuard, cli_args: &CliArgs) -> anyhow::Result<EditorOutcome> {
-    let (mut buffer, file_name) = init_buffer(&cli_args.destination)?;
-
-    let (lang_id, lang_name) = match &cli_args.destination {
-        OutputDestination::File(path) => {
-            (language_id_from_path(path), file_type_for_path(path).name())
-        }
-        OutputDestination::Stdout => (None, "Plain Text"),
-    };
+    let (mut buffer, file_name) = init_buffer(&cli_args.destination, cli_args.mode)?;
+    let (lang_id, lang_name) = resolve_language(cli_args);
     let mut syntax_state = lang_id.map(|lang| SyntaxState::new(lang, &buffer.text()));
     let mut plain_folds = if syntax_state.is_none() {
         fold_by_indent(&buffer.text(), 4)
@@ -250,10 +403,12 @@ fn run_editor_loop(guard: &mut TerminalGuard, cli_args: &CliArgs) -> anyhow::Res
     let mut auto_closers: Vec<LineCol> = Vec::new();
     let mut click_tracker = ClickTracker::default();
     let mut editor_drag: Option<EditorDrag> = None;
+    let mut search = SearchState::default();
 
     loop {
         let folds = syntax_state.as_ref().map_or(&plain_folds, |syn| &syn.folds);
         let resolved_folds = resolve_folds(folds, &folded);
+        let search_decorations = search.decorations();
 
         let render_ctx = RenderContext {
             buffer: &buffer,
@@ -262,10 +417,12 @@ fn run_editor_loop(guard: &mut TerminalGuard, cli_args: &CliArgs) -> anyhow::Res
             highlights: syntax_state
                 .as_ref()
                 .and_then(|syn| syn.rendered_highlights.as_ref()),
+            decorations: &search_decorations,
             lang_name,
             file_name: &file_name,
             mode: cli_args.mode,
             in_confirm_discard,
+            search: &search,
         };
 
         guard.terminal_mut().draw(|frame| {
@@ -282,15 +439,16 @@ fn run_editor_loop(guard: &mut TerminalGuard, cli_args: &CliArgs) -> anyhow::Res
                 Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
                     click_tracker.reset();
                     editor_drag = None;
-                    match handle_key_press(
-                        key,
-                        &mut in_confirm_discard,
+                    let mut key_ctx = KeyContext {
+                        in_confirm_discard: &mut in_confirm_discard,
                         cli_args,
-                        &mut buffer,
-                        &mut state,
-                        &mut syntax_state,
-                        &mut auto_closers,
-                    )? {
+                        buffer: &mut buffer,
+                        state: &mut state,
+                        syntax_state: &mut syntax_state,
+                        auto_closers: &mut auto_closers,
+                        search: &mut search,
+                    };
+                    match handle_key_press(key, &mut key_ctx)? {
                         LoopControl::Continue {
                             text_changed: changed,
                         } => {
@@ -404,39 +562,41 @@ mod tests {
         let cli_args = CliArgs {
             mode: EditorMode::Normal,
             destination: OutputDestination::File(PathBuf::from("test.txt")),
+            language: None,
         };
         let mut buffer = TextBuffer::from_text("clean text");
         let mut state = EditorState::new();
         let mut in_confirm_discard = false;
+        let mut search = SearchState::default();
+
+        let mut key_ctx = KeyContext {
+            in_confirm_discard: &mut in_confirm_discard,
+            cli_args: &cli_args,
+            buffer: &mut buffer,
+            state: &mut state,
+            syntax_state: &mut None,
+            auto_closers: &mut Vec::new(),
+            search: &mut search,
+        };
 
         // Clean Esc: exits immediately with code 1
         let res = handle_key_press(
             KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
-            &mut in_confirm_discard,
-            &cli_args,
-            &mut buffer,
-            &mut state,
-            &mut None,
-            &mut Vec::new(),
+            &mut key_ctx,
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
-        assert!(!in_confirm_discard);
+        assert!(!*key_ctx.in_confirm_discard);
 
         // Edit buffer -> dirty
-        let edit = editing::insert(LineCol::new(0, 0), None, buffer.version(), "dirty ");
-        buffer.apply_simple(&edit.change).unwrap();
-        assert!(buffer.is_dirty());
+        let edit = editing::insert(LineCol::new(0, 0), None, key_ctx.buffer.version(), "dirty ");
+        key_ctx.buffer.apply_simple(&edit.change).unwrap();
+        assert!(key_ctx.buffer.is_dirty());
 
         // Dirty Esc: enters confirmation mode
         let res = handle_key_press(
             KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
-            &mut in_confirm_discard,
-            &cli_args,
-            &mut buffer,
-            &mut state,
-            &mut None,
-            &mut Vec::new(),
+            &mut key_ctx,
         )
         .unwrap();
         assert!(matches!(
@@ -445,17 +605,12 @@ mod tests {
                 text_changed: false
             }
         ));
-        assert!(in_confirm_discard);
+        assert!(*key_ctx.in_confirm_discard);
 
         // While in confirm discard, pressing 'n' cancels confirmation
         let res = handle_key_press(
             KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE),
-            &mut in_confirm_discard,
-            &cli_args,
-            &mut buffer,
-            &mut state,
-            &mut None,
-            &mut Vec::new(),
+            &mut key_ctx,
         )
         .unwrap();
         assert!(matches!(
@@ -464,30 +619,20 @@ mod tests {
                 text_changed: false
             }
         ));
-        assert!(!in_confirm_discard);
+        assert!(!*key_ctx.in_confirm_discard);
 
         // Dirty Esc again -> confirm discard
         handle_key_press(
             KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
-            &mut in_confirm_discard,
-            &cli_args,
-            &mut buffer,
-            &mut state,
-            &mut None,
-            &mut Vec::new(),
+            &mut key_ctx,
         )
         .unwrap();
-        assert!(in_confirm_discard);
+        assert!(*key_ctx.in_confirm_discard);
 
         // Pressing 'y' confirms discard and exits with code 1
         let res = handle_key_press(
             KeyEvent::new(KeyCode::Char('y'), crossterm::event::KeyModifiers::NONE),
-            &mut in_confirm_discard,
-            &cli_args,
-            &mut buffer,
-            &mut state,
-            &mut None,
-            &mut Vec::new(),
+            &mut key_ctx,
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
@@ -506,20 +651,27 @@ mod tests {
         let cli_args = CliArgs {
             mode: EditorMode::Prompt,
             destination: OutputDestination::File(temp_file.clone()),
+            language: None,
         };
         let mut buffer = TextBuffer::from_text("commit message");
         let mut state = EditorState::new();
         let mut in_confirm_discard = false;
+        let mut search = SearchState::default();
+
+        let mut key_ctx = KeyContext {
+            in_confirm_discard: &mut in_confirm_discard,
+            cli_args: &cli_args,
+            buffer: &mut buffer,
+            state: &mut state,
+            syntax_state: &mut None,
+            auto_closers: &mut Vec::new(),
+            search: &mut search,
+        };
 
         // In prompt mode, Enter saves and accepts with code 0
         let res = handle_key_press(
             KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
-            &mut in_confirm_discard,
-            &cli_args,
-            &mut buffer,
-            &mut state,
-            &mut None,
-            &mut Vec::new(),
+            &mut key_ctx,
         )
         .unwrap();
         assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::SUCCESS));
@@ -532,22 +684,88 @@ mod tests {
         let cli_args = CliArgs {
             mode: EditorMode::Prompt,
             destination: OutputDestination::Stdout,
+            language: None,
         };
         let mut buffer = TextBuffer::from_text("piped commit message");
         let mut state = EditorState::new();
         let mut in_confirm_discard = false;
+        let mut search = SearchState::default();
+
+        let mut key_ctx = KeyContext {
+            in_confirm_discard: &mut in_confirm_discard,
+            cli_args: &cli_args,
+            buffer: &mut buffer,
+            state: &mut state,
+            syntax_state: &mut None,
+            auto_closers: &mut Vec::new(),
+            search: &mut search,
+        };
 
         let res = handle_key_press(
             KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
-            &mut in_confirm_discard,
-            &cli_args,
-            &mut buffer,
-            &mut state,
-            &mut None,
-            &mut Vec::new(),
+            &mut key_ctx,
         )
         .unwrap();
         assert_eq!(res, LoopControl::AcceptStdout);
+    }
+
+    #[test]
+    fn test_handle_key_press_view_mode_quit_and_search() {
+        let cli_args = CliArgs {
+            mode: EditorMode::View,
+            destination: OutputDestination::Stdout,
+            language: Some("rust".to_owned()),
+        };
+        let mut buffer = TextBuffer::from_text("fn main() {\n    println!(\"hi\");\n}\n");
+        let mut state = EditorState::new();
+        let mut in_confirm_discard = false;
+        let mut search = SearchState::default();
+        let mut syntax_state = None;
+        let mut auto_closers = Vec::new();
+        let mut key_ctx = KeyContext {
+            in_confirm_discard: &mut in_confirm_discard,
+            cli_args: &cli_args,
+            buffer: &mut buffer,
+            state: &mut state,
+            syntax_state: &mut syntax_state,
+            auto_closers: &mut auto_closers,
+            search: &mut search,
+        };
+
+        // '/' activates search bar
+        handle_key_press(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(key_ctx.search.active);
+
+        // Typing 'main' finds match
+        for ch in "main".chars() {
+            handle_key_press(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut key_ctx,
+            )
+            .unwrap();
+        }
+        assert_eq!(key_ctx.search.matches.len(), 1);
+
+        // Enter closes search input bar while keeping matches
+        handle_key_press(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(!key_ctx.search.active);
+        assert_eq!(key_ctx.search.matches.len(), 1);
+
+        // 'q' quits cleanly
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert_eq!(res, LoopControl::Exit(ExitCode::SUCCESS));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use ratatui::{
 };
 
 use crate::keymap::EditorMode;
+use crate::search::SearchState;
 
 const SEPARATOR: &str = " \u{b7} ";
 const CTRL: &str = "\u{2303}";
@@ -26,6 +27,7 @@ pub struct StatusBarConfig<'a> {
     pub mode: EditorMode,
     pub in_confirm_discard: bool,
     pub pct_below: u8,
+    pub search: Option<&'a SearchState>,
 }
 
 pub struct StatusBar<'a> {
@@ -41,7 +43,7 @@ impl<'a> StatusBar<'a> {
             .bg(theme.role(ThemeRole::StatusBarBackground).to_ratatui())
             .fg(theme.role(ThemeRole::StatusBarForeground).to_ratatui());
 
-        // Left hints or discard confirmation prompt
+        // Left hints, search bar, or discard confirmation prompt
         let left = if config.in_confirm_discard {
             let warning_color = theme.role(ThemeRole::DiagnosticWarning).to_ratatui();
             Line::from(vec![Span::styled(
@@ -50,6 +52,22 @@ impl<'a> StatusBar<'a> {
                     .fg(warning_color)
                     .add_modifier(Modifier::BOLD),
             )])
+        } else if let Some(search) = config.search
+            && (search.active || !search.query.is_empty())
+        {
+            let count_label = if search.query.is_empty() {
+                String::new()
+            } else if search.matches.is_empty() {
+                " [no matches]".to_owned()
+            } else {
+                let idx = search.current.map_or(0, |i| i + 1);
+                format!(" [{idx}/{}]", search.matches.len())
+            };
+            Line::from(vec![
+                Span::styled("/", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(search.query.clone()),
+                Span::raw(count_label),
+            ])
         } else {
             let left_text = match config.mode {
                 EditorMode::Prompt => {
@@ -60,6 +78,11 @@ impl<'a> StatusBar<'a> {
                 EditorMode::Normal => {
                     format!(
                         "{CTRL}S: Save{SEPARATOR}{CTRL}Q: Quit{SEPARATOR}{ESC}: Abort{SEPARATOR}{CTRL}Z: Undo"
+                    )
+                }
+                EditorMode::View => {
+                    format!(
+                        "q/{ESC}: Quit{SEPARATOR}/: Search{SEPARATOR}n/N: Next/Prev{SEPARATOR}j/k: Scroll"
                     )
                 }
             };
@@ -134,6 +157,7 @@ mod tests {
             mode: EditorMode::Normal,
             in_confirm_discard: false,
             pct_below: 80,
+            search: None,
         };
         let bar = StatusBar::new(&theme, &config);
         assert!(bar.right.to_string().contains("test.rs"));
@@ -155,6 +179,7 @@ mod tests {
             mode: EditorMode::Prompt,
             in_confirm_discard: true,
             pct_below: 0,
+            search: None,
         };
         let bar = StatusBar::new(&theme, &config);
         assert!(bar.right.to_string().contains("note.md*"));
@@ -174,6 +199,7 @@ mod tests {
             mode: EditorMode::Prompt,
             in_confirm_discard: false,
             pct_below: 50,
+            search: None,
         };
         let bar = StatusBar::new(&theme, &config);
         assert!(bar.left.to_string().contains("\u{23ce}: Accept"));
@@ -198,6 +224,7 @@ mod tests {
             mode: EditorMode::Normal,
             in_confirm_discard: false,
             pct_below: 100,
+            search: None,
         };
         let bar = StatusBar::new(&theme, &config);
         terminal
