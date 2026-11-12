@@ -10,6 +10,7 @@ use ratatui::{
 };
 
 use crate::keymap::EditorMode;
+use crate::query::QueryFocus;
 use crate::search::SearchState;
 
 const SEPARATOR: &str = " \u{b7} ";
@@ -28,6 +29,8 @@ pub struct StatusBarConfig<'a> {
     pub in_confirm_discard: bool,
     pub pct_below: u8,
     pub search: Option<&'a SearchState>,
+    pub query_focus: Option<QueryFocus>,
+    pub query_error: Option<&'a str>,
 }
 
 pub struct StatusBar<'a> {
@@ -68,6 +71,14 @@ impl<'a> StatusBar<'a> {
                 Span::raw(search.query.clone()),
                 Span::raw(count_label),
             ])
+        } else if let Some(err) = config.query_error {
+            let warning_color = theme.role(ThemeRole::DiagnosticWarning).to_ratatui();
+            Line::from(vec![Span::styled(
+                format!("\u{26a0} {err}"),
+                Style::default()
+                    .fg(warning_color)
+                    .add_modifier(Modifier::BOLD),
+            )])
         } else {
             let left_text = match config.mode {
                 EditorMode::Prompt => {
@@ -83,6 +94,12 @@ impl<'a> StatusBar<'a> {
                 EditorMode::View => {
                     format!(
                         "q/{ESC}: Quit{SEPARATOR}/: Search{SEPARATOR}n/N: Next/Prev{SEPARATOR}j/k: Scroll"
+                    )
+                }
+                EditorMode::Query => {
+                    let target = config.query_focus.map_or("Output", QueryFocus::label);
+                    format!(
+                        "Tab: Switch{SEPARATOR}{ENTER}: Print {target}{SEPARATOR}{ESC}: Abort"
                     )
                 }
             };
@@ -116,7 +133,10 @@ impl<'a> StatusBar<'a> {
         let _ = write!(cursor_label, " {}%", config.pct_below);
         right_segments.push(cursor_label);
 
-        // Language
+        // Language & optional QueryFocus
+        if let Some(focus) = config.query_focus {
+            right_segments.push(format!("[{}]", focus.label()));
+        }
         right_segments.push(config.language.to_owned());
 
         let right = Line::from(vec![Span::raw(right_segments.join(SEPARATOR))]);
@@ -158,6 +178,8 @@ mod tests {
             in_confirm_discard: false,
             pct_below: 80,
             search: None,
+            query_focus: None,
+            query_error: None,
         };
         let bar = StatusBar::new(&theme, &config);
         assert!(bar.right.to_string().contains("test.rs"));
@@ -180,6 +202,8 @@ mod tests {
             in_confirm_discard: true,
             pct_below: 0,
             search: None,
+            query_focus: None,
+            query_error: None,
         };
         let bar = StatusBar::new(&theme, &config);
         assert!(bar.right.to_string().contains("note.md*"));
@@ -200,6 +224,8 @@ mod tests {
             in_confirm_discard: false,
             pct_below: 50,
             search: None,
+            query_focus: None,
+            query_error: None,
         };
         let bar = StatusBar::new(&theme, &config);
         assert!(bar.left.to_string().contains("\u{23ce}: Accept"));
@@ -225,6 +251,8 @@ mod tests {
             in_confirm_discard: false,
             pct_below: 100,
             search: None,
+            query_focus: None,
+            query_error: None,
         };
         let bar = StatusBar::new(&theme, &config);
         terminal

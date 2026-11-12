@@ -104,7 +104,12 @@ lang-lockfile = ["karet-syntax/lang-lockfile"]
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6", features = ["derive"] }
-crossterm = "0.29.0"
+crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
+jaq-core = "3.1"
+jaq-fmts = "0.1"
+jaq-json = { version = "2.0", features = ["serde"] }
+jaq-std = "3.0"
+json-pretty-compact = "0.1"
 karet-core = "0.7.1"
 karet-editor = "0.7.1"
 karet-filetype = "0.7.1"
@@ -114,6 +119,8 @@ karet-theme = "0.7.1"
 karet-treesitter = "0.7.1"
 karet-widgets = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }
 ratatui = "0.30.2"
+serde = "1.0"
+serde_json = "1.0"
 
 [patch.crates-io]
 karet-core = { git = "https://github.com/getkono/karet.git", rev = "d5dc704e9be3b7bc3a9792767746bb34bc5b49bb" }

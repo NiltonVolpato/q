@@ -16,6 +16,8 @@ pub struct CliArgs {
     pub mode: EditorMode,
     pub destination: OutputDestination,
     pub language: Option<String>,
+    pub query: Option<String>,
+    pub format: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -33,6 +35,8 @@ enum Command {
     Prompt(PromptArgs),
     /// View a file or stdin in read-only pager mode
     View(ViewArgs),
+    /// Interactively query JSON/YAML/TOML/CBOR/XML with jaq
+    Query(QueryArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -60,15 +64,33 @@ struct ViewArgs {
     language: Option<String>,
 }
 
+#[derive(Parser, Debug)]
+#[command(about = "Interactively query JSON/YAML/TOML/CBOR/XML with jaq")]
+struct QueryArgs {
+    /// Optional jaq filter expression or file path (like `jq`: `qq FILE` or `qq QUERY FILE`)
+    #[arg(value_name = "QUERY_OR_FILE")]
+    first: Option<String>,
+
+    /// Path to file to query when a filter expression is given (omit or '-' for stdin)
+    #[arg(value_name = "FILE")]
+    second: Option<String>,
+
+    /// Input format (json, yaml, toml, cbor, xml, csv, tsv)
+    #[arg(short, long, value_name = "FORMAT")]
+    format: Option<String>,
+}
+
 impl EditArgs {
     fn into_cli_args(self) -> anyhow::Result<CliArgs> {
         if self.file.as_os_str() == "-" {
-            anyhow::bail!("'-' is only supported in prompt or view mode.");
+            anyhow::bail!("'-' is only supported in prompt, view, or query mode.");
         }
         Ok(CliArgs {
             mode: EditorMode::Normal,
             destination: OutputDestination::File(self.file),
             language: None,
+            query: None,
+            format: None,
         })
     }
 }
@@ -83,6 +105,8 @@ impl PromptArgs {
             mode: EditorMode::Prompt,
             destination,
             language: None,
+            query: None,
+            format: None,
         }
     }
 }
@@ -97,6 +121,35 @@ impl ViewArgs {
             mode: EditorMode::View,
             destination,
             language: self.language,
+            query: None,
+            format: None,
+        }
+    }
+}
+
+impl QueryArgs {
+    fn into_cli_args(self) -> CliArgs {
+        let (query, file) = match (self.first, self.second) {
+            (None, _) => (None, None),
+            (Some(first), Some(second)) => (Some(first), Some(second)),
+            (Some(only), None) => {
+                if only == "-" || Path::new(&only).exists() {
+                    (None, Some(only))
+                } else {
+                    (Some(only), None)
+                }
+            }
+        };
+        let destination = match file.as_deref() {
+            None | Some("-") => OutputDestination::Stdout,
+            Some(path) => OutputDestination::File(PathBuf::from(path)),
+        };
+        CliArgs {
+            mode: EditorMode::Query,
+            destination,
+            language: None,
+            query,
+            format: self.format,
         }
     }
 }
@@ -168,6 +221,13 @@ where
             };
             Ok(Some(view_args.into_cli_args()))
         }
+        "qq" => {
+            let Some(query_args) = handle_clap_result(parse_alias::<QueryArgs>("qq", args_iter))?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(query_args.into_cli_args()))
+        }
         _ => {
             let full_args = std::iter::once(program).chain(args_iter);
             let Some(cli) = handle_clap_result(Cli::try_parse_from(full_args))? else {
@@ -177,6 +237,7 @@ where
                 Command::Edit(edit_args) => Ok(Some(edit_args.into_cli_args()?)),
                 Command::Prompt(prompt_args) => Ok(Some(prompt_args.into_cli_args())),
                 Command::View(view_args) => Ok(Some(view_args.into_cli_args())),
+                Command::Query(query_args) => Ok(Some(query_args.into_cli_args())),
             }
         }
     }
@@ -270,6 +331,39 @@ mod tests {
         assert_eq!(parsed_dash.mode, EditorMode::View);
         assert_eq!(parsed_dash.destination, OutputDestination::Stdout);
         assert_eq!(parsed_dash.language.as_deref(), Some("py"));
+    }
+
+    #[test]
+    fn test_q_query_and_qq_alias() {
+        // Existing file as single positional arg -> file with default query
+        let parsed = parse_args(["q", "query", "Cargo.toml"]).unwrap().unwrap();
+        assert_eq!(parsed.mode, EditorMode::Query);
+        assert_eq!(
+            parsed.destination,
+            OutputDestination::File(PathBuf::from("Cargo.toml"))
+        );
+        assert_eq!(parsed.query, None);
+        assert_eq!(parsed.format, None);
+
+        // Filter as single positional arg -> query on stdin
+        let parsed_filter = parse_args(["qq", ".items[]", "-f", "yaml"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed_filter.mode, EditorMode::Query);
+        assert_eq!(parsed_filter.destination, OutputDestination::Stdout);
+        assert_eq!(parsed_filter.query.as_deref(), Some(".items[]"));
+        assert_eq!(parsed_filter.format.as_deref(), Some("yaml"));
+
+        // Two positional args -> query then file
+        let parsed_both = parse_args(["qq", ".package.name", "Cargo.toml"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed_both.mode, EditorMode::Query);
+        assert_eq!(
+            parsed_both.destination,
+            OutputDestination::File(PathBuf::from("Cargo.toml"))
+        );
+        assert_eq!(parsed_both.query.as_deref(), Some(".package.name"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub enum EditorMode {
     Normal,
     Prompt,
     View,
+    Query,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +52,7 @@ pub const fn map_key(key: KeyEvent, mode: EditorMode) -> Action {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    if matches!(mode, EditorMode::View) {
+    if matches!(mode, EditorMode::View | EditorMode::Query) {
         return map_view_key(key.code, ctrl, alt, shift);
     }
 
