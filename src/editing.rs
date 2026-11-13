@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use karet_core::{LineCol, Range};
+use karet_core::{LineCol, Range, TextEdit};
 use karet_editor::{
     EditorState, Motion, editing,
     editing::LineComment,
@@ -180,6 +180,17 @@ pub fn resolve_auto_pairs<'a>(
     }
 }
 
+/// Update tracked auto-closer positions across `edits`, dropping any closer
+/// whose character was deleted or replaced.
+fn remap_auto_closers(auto_closers: &mut Vec<LineCol>, edits: &[TextEdit]) {
+    auto_closers.retain(|pos| !edits.iter().any(|e| e.range.start <= *pos && *pos < e.range.end));
+    for pos in auto_closers.iter_mut() {
+        *pos = editing::map_position(*pos, edits);
+    }
+    auto_closers.sort_unstable();
+    auto_closers.dedup();
+}
+
 pub fn handle_insert_char(
     buffer: &mut TextBuffer,
     state: &mut EditorState,
@@ -205,14 +216,17 @@ pub fn handle_insert_char(
             Ok(true)
         }
     } else {
-        auto_closers.clear();
         let edit = editing::insert(
             state.cursor(),
             state.selection_range(),
             buffer.version(),
             &c.to_string(),
         );
-        apply_single_edit(buffer, state, syntax_state, &edit)
+        let applied = apply_single_edit(buffer, state, syntax_state, &edit)?;
+        if applied {
+            remap_auto_closers(auto_closers, &edit.change.edits);
+        }
+        Ok(applied)
     }
 }
 
@@ -261,22 +275,27 @@ pub fn handle_backspace(
     syntax_state: &mut Option<SyntaxState>,
     auto_closers: &mut Vec<LineCol>,
 ) -> anyhow::Result<bool> {
-    auto_closers.clear();
     let rules = resolve_auto_pairs(destination, syntax_state.as_ref());
     if let Some(edit) = autopair::backspace(buffer, state.cursors(), buffer.version(), &rules) {
-        apply_multi_edit(buffer, state, syntax_state, edit)
+        let edits = edit.change.edits.clone();
+        let applied = apply_multi_edit(buffer, state, syntax_state, edit)?;
+        if applied {
+            remap_auto_closers(auto_closers, &edits);
+        }
+        Ok(applied)
+    } else if let Some(edit) = editing::backspace(
+        state.cursor(),
+        state.selection_range(),
+        buffer,
+        buffer.version(),
+    ) {
+        let applied = apply_single_edit(buffer, state, syntax_state, &edit)?;
+        if applied {
+            remap_auto_closers(auto_closers, &edit.change.edits);
+        }
+        Ok(applied)
     } else {
-        apply_opt_single_edit(
-            buffer,
-            state,
-            syntax_state,
-            editing::backspace(
-                state.cursor(),
-                state.selection_range(),
-                buffer,
-                buffer.version(),
-            ),
-        )
+        Ok(false)
     }
 }
 
@@ -762,5 +781,60 @@ mod tests {
         .unwrap();
         assert_eq!(buffer.text(), "{\n    \n}");
         assert_eq!(state.cursor(), LineCol::new(1, 4));
+    }
+
+    #[test]
+    fn test_autopair_step_over_after_typing_inside() {
+        let mut buffer = TextBuffer::from_text("");
+        let mut state = EditorState::new();
+        let dest = OutputDestination::Stdout;
+        let mut syntax = None;
+        let mut closers = Vec::new();
+
+        for ch in ['[', '0', ']'] {
+            handle_action(
+                Action::InsertChar(ch),
+                &mut buffer,
+                &mut state,
+                &dest,
+                &mut syntax,
+                &mut closers,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(buffer.text(), "[0]");
+        assert_eq!(state.cursor(), LineCol::new(0, 3));
+        assert_eq!(closers, []);
+    }
+
+    #[test]
+    fn test_autopair_step_over_after_backspace_inside() {
+        let mut buffer = TextBuffer::from_text("");
+        let mut state = EditorState::new();
+        let dest = OutputDestination::Stdout;
+        let mut syntax = None;
+        let mut closers = Vec::new();
+
+        for action in [
+            Action::InsertChar('['),
+            Action::InsertChar('a'),
+            Action::DeleteBackward,
+            Action::InsertChar(']'),
+        ] {
+            handle_action(
+                action,
+                &mut buffer,
+                &mut state,
+                &dest,
+                &mut syntax,
+                &mut closers,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(buffer.text(), "[]");
+        assert_eq!(state.cursor(), LineCol::new(0, 2));
+        assert_eq!(closers, []);
     }
 }
