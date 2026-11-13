@@ -338,9 +338,8 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::RenderContext;
+    use crate::app::{RenderContext, render_editor};
     use crate::keymap::EditorMode;
-    use crate::render_editor;
     use crate::syntax::SyntaxState;
 
     fn draw_editor_for_test(

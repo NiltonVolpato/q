@@ -90,55 +90,69 @@ fn comment_tokens_at(
         .unwrap_or(own)
 }
 
-pub fn apply_single_edit(
+fn apply_change(
+    buffer: &mut TextBuffer,
+    syntax_state: &mut Option<SyntaxState>,
+    change: &karet_core::Change,
+    auto_closers: Option<&mut Vec<LineCol>>,
+) -> anyhow::Result<()> {
+    let applied = buffer.apply_simple(change)?;
+    if let Some(syn) = syntax_state {
+        syn.record_edits(&applied.edits);
+    }
+    if let Some(closers) = auto_closers {
+        remap_auto_closers(closers, &change.edits);
+    }
+    Ok(())
+}
+
+fn apply_single_edit(
     buffer: &mut TextBuffer,
     state: &mut EditorState,
     syntax_state: &mut Option<SyntaxState>,
     edit: &editing::Edit,
+    auto_closers: Option<&mut Vec<LineCol>>,
 ) -> anyhow::Result<bool> {
-    let applied = buffer.apply_simple(&edit.change)?;
-    if let Some(syn) = syntax_state {
-        syn.record_edits(&applied.edits);
-    }
+    apply_change(buffer, syntax_state, &edit.change, auto_closers)?;
     state.goto(buffer, edit.caret);
     Ok(true)
 }
 
-pub fn apply_opt_single_edit(
+fn apply_opt_single_edit(
     buffer: &mut TextBuffer,
     state: &mut EditorState,
     syntax_state: &mut Option<SyntaxState>,
     edit: Option<editing::Edit>,
+    auto_closers: Option<&mut Vec<LineCol>>,
 ) -> anyhow::Result<bool> {
     edit.map_or_else(
         || Ok(false),
-        |e| apply_single_edit(buffer, state, syntax_state, &e),
+        |e| apply_single_edit(buffer, state, syntax_state, &e, auto_closers),
     )
 }
 
-pub fn apply_multi_edit(
+fn apply_multi_edit(
     buffer: &mut TextBuffer,
     state: &mut EditorState,
     syntax_state: &mut Option<SyntaxState>,
     multi: editing::MultiEdit,
+    auto_closers: Option<&mut Vec<LineCol>>,
 ) -> anyhow::Result<bool> {
-    let applied = buffer.apply_simple(&multi.change)?;
-    if let Some(syn) = syntax_state {
-        syn.record_edits(&applied.edits);
-    }
+    apply_change(buffer, syntax_state, &multi.change, auto_closers)?;
     state.set_cursor_state(buffer, multi.cursors);
     Ok(true)
 }
 
-pub fn apply_opt_multi_edit(
+fn apply_opt_multi_edit(
     buffer: &mut TextBuffer,
     state: &mut EditorState,
     syntax_state: &mut Option<SyntaxState>,
     multi: Option<editing::MultiEdit>,
+    auto_closers: Option<&mut Vec<LineCol>>,
 ) -> anyhow::Result<bool> {
     multi.map_or_else(
         || Ok(false),
-        |m| apply_multi_edit(buffer, state, syntax_state, m),
+        |m| apply_multi_edit(buffer, state, syntax_state, m, auto_closers),
     )
 }
 
@@ -156,7 +170,7 @@ pub fn toggle_comment(
         (None, None) => return Ok(false),
     };
     let multi = editing::toggle_line_comment(buffer, state.cursors(), buffer.version(), token);
-    apply_opt_multi_edit(buffer, state, syntax_state, multi)
+    apply_opt_multi_edit(buffer, state, syntax_state, multi, None)
 }
 
 #[must_use]
@@ -210,7 +224,7 @@ pub fn handle_insert_char(
     ) {
         *auto_closers = typed.closers;
         if let Some(edit) = typed.edit {
-            apply_multi_edit(buffer, state, syntax_state, edit)
+            apply_multi_edit(buffer, state, syntax_state, edit, None)
         } else {
             state.set_cursor_state(buffer, typed.cursors);
             Ok(true)
@@ -222,11 +236,7 @@ pub fn handle_insert_char(
             buffer.version(),
             &c.to_string(),
         );
-        let applied = apply_single_edit(buffer, state, syntax_state, &edit)?;
-        if applied {
-            remap_auto_closers(auto_closers, &edit.change.edits);
-        }
-        Ok(applied)
+        apply_single_edit(buffer, state, syntax_state, &edit, Some(auto_closers))
     }
 }
 
@@ -252,7 +262,7 @@ pub fn handle_insert_newline(
         "    ",
         &indent_fn,
     ) {
-        apply_multi_edit(buffer, state, syntax_state, edit)
+        apply_multi_edit(buffer, state, syntax_state, edit, None)
     } else {
         let indent = syntax_state.as_ref().and_then(|syn| {
             syn.compute_newline_indent(buffer, state.cursor(), state.selection_range())
@@ -264,7 +274,7 @@ pub fn handle_insert_newline(
             buffer.version(),
             indent.as_deref(),
         );
-        apply_single_edit(buffer, state, syntax_state, &edit)
+        apply_single_edit(buffer, state, syntax_state, &edit, None)
     }
 }
 
@@ -277,25 +287,15 @@ pub fn handle_backspace(
 ) -> anyhow::Result<bool> {
     let rules = resolve_auto_pairs(destination, syntax_state.as_ref());
     if let Some(edit) = autopair::backspace(buffer, state.cursors(), buffer.version(), &rules) {
-        let edits = edit.change.edits.clone();
-        let applied = apply_multi_edit(buffer, state, syntax_state, edit)?;
-        if applied {
-            remap_auto_closers(auto_closers, &edits);
-        }
-        Ok(applied)
-    } else if let Some(edit) = editing::backspace(
-        state.cursor(),
-        state.selection_range(),
-        buffer,
-        buffer.version(),
-    ) {
-        let applied = apply_single_edit(buffer, state, syntax_state, &edit)?;
-        if applied {
-            remap_auto_closers(auto_closers, &edit.change.edits);
-        }
-        Ok(applied)
+        apply_multi_edit(buffer, state, syntax_state, edit, Some(auto_closers))
     } else {
-        Ok(false)
+        let edit = editing::backspace(
+            state.cursor(),
+            state.selection_range(),
+            buffer,
+            buffer.version(),
+        );
+        apply_opt_single_edit(buffer, state, syntax_state, edit, Some(auto_closers))
     }
 }
 
@@ -349,6 +349,7 @@ pub fn handle_edit_action(
                 state,
                 syntax_state,
                 editing::indent(buffer, state.cursors(), buffer.version(), "    ", 4),
+                None,
             )
         }
         Action::Dedent => {
@@ -358,6 +359,7 @@ pub fn handle_edit_action(
                 state,
                 syntax_state,
                 editing::dedent(buffer, state.cursors(), buffer.version(), "    ", 4),
+                None,
             )
         }
         Action::InsertNewline => {
@@ -378,6 +380,7 @@ pub fn handle_edit_action(
                     buffer,
                     buffer.version(),
                 ),
+                None,
             )
         }
         Action::DeleteWordBackward => {
@@ -392,6 +395,7 @@ pub fn handle_edit_action(
                     buffer,
                     buffer.version(),
                 ),
+                None,
             )
         }
         Action::DeleteWordForward => {
@@ -406,6 +410,7 @@ pub fn handle_edit_action(
                     buffer,
                     buffer.version(),
                 ),
+                None,
             )
         }
         _ => Ok(false),
@@ -682,36 +687,36 @@ mod tests {
         assert_eq!(state.cursor(), LineCol::new(2, 1));
     }
 
-    #[test]
-    fn test_autopair_insert_and_step_over() {
+    fn run_actions(
+        actions: &[Action],
+        dest: &OutputDestination,
+        syntax: &mut Option<SyntaxState>,
+    ) -> (TextBuffer, EditorState, Vec<LineCol>) {
         let mut buffer = TextBuffer::from_text("");
         let mut state = EditorState::new();
-        let dest = OutputDestination::File(PathBuf::from("test.rs"));
-        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
         let mut closers = Vec::new();
+        for &action in actions {
+            handle_action(action, &mut buffer, &mut state, dest, syntax, &mut closers).unwrap();
+        }
+        (buffer, state, closers)
+    }
 
-        handle_action(
-            Action::InsertChar('{'),
-            &mut buffer,
-            &mut state,
-            &dest,
-            &mut syntax,
-            &mut closers,
-        )
-        .unwrap();
+    #[test]
+    fn test_autopair_insert_and_step_over() {
+        let dest = OutputDestination::File(PathBuf::from("test.rs"));
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), ""));
+
+        let (buffer, state, closers) =
+            run_actions(&[Action::InsertChar('{')], &dest, &mut syntax);
         assert_eq!(buffer.text(), "{}");
         assert_eq!(state.cursor(), LineCol::new(0, 1));
         assert_eq!(closers, vec![LineCol::new(0, 1)]);
 
-        handle_action(
-            Action::InsertChar('}'),
-            &mut buffer,
-            &mut state,
+        let (buffer, state, closers) = run_actions(
+            &[Action::InsertChar('{'), Action::InsertChar('}')],
             &dest,
             &mut syntax,
-            &mut closers,
-        )
-        .unwrap();
+        );
         assert_eq!(buffer.text(), "{}");
         assert_eq!(state.cursor(), LineCol::new(0, 2));
         assert_eq!(closers, []);
@@ -719,90 +724,42 @@ mod tests {
 
     #[test]
     fn test_autopair_empty_backspace() {
-        let mut buffer = TextBuffer::from_text("");
-        let mut state = EditorState::new();
         let dest = OutputDestination::File(PathBuf::from("test.rs"));
-        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
-        let mut closers = Vec::new();
-
-        handle_action(
-            Action::InsertChar('{'),
-            &mut buffer,
-            &mut state,
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), ""));
+        let (buffer, state, _) = run_actions(
+            &[Action::InsertChar('{'), Action::DeleteBackward],
             &dest,
             &mut syntax,
-            &mut closers,
-        )
-        .unwrap();
-        assert_eq!(buffer.text(), "{}");
-        assert_eq!(state.cursor(), LineCol::new(0, 1));
-
-        handle_action(
-            Action::DeleteBackward,
-            &mut buffer,
-            &mut state,
-            &dest,
-            &mut syntax,
-            &mut closers,
-        )
-        .unwrap();
+        );
         assert_eq!(buffer.text(), "");
         assert_eq!(state.cursor(), LineCol::new(0, 0));
     }
 
     #[test]
     fn test_autopair_newline_bracket_expansion() {
-        let mut buffer = TextBuffer::from_text("");
-        let mut state = EditorState::new();
         let dest = OutputDestination::File(PathBuf::from("test.rs"));
-        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), &buffer.text()));
-        let mut closers = Vec::new();
-
-        handle_action(
-            Action::InsertChar('{'),
-            &mut buffer,
-            &mut state,
+        let mut syntax = Some(SyntaxState::new(languages::RUST.unwrap(), ""));
+        let (buffer, state, _) = run_actions(
+            &[Action::InsertChar('{'), Action::InsertNewline],
             &dest,
             &mut syntax,
-            &mut closers,
-        )
-        .unwrap();
-        assert_eq!(buffer.text(), "{}");
-        assert_eq!(state.cursor(), LineCol::new(0, 1));
-
-        handle_action(
-            Action::InsertNewline,
-            &mut buffer,
-            &mut state,
-            &dest,
-            &mut syntax,
-            &mut closers,
-        )
-        .unwrap();
+        );
         assert_eq!(buffer.text(), "{\n    \n}");
         assert_eq!(state.cursor(), LineCol::new(1, 4));
     }
 
     #[test]
     fn test_autopair_step_over_after_typing_inside() {
-        let mut buffer = TextBuffer::from_text("");
-        let mut state = EditorState::new();
-        let dest = OutputDestination::Stdout;
         let mut syntax = None;
-        let mut closers = Vec::new();
-
-        for ch in ['[', '0', ']'] {
-            handle_action(
-                Action::InsertChar(ch),
-                &mut buffer,
-                &mut state,
-                &dest,
-                &mut syntax,
-                &mut closers,
-            )
-            .unwrap();
-        }
-
+        let (buffer, state, closers) = run_actions(
+            &[
+                Action::InsertChar('['),
+                Action::InsertChar('0'),
+                Action::InsertChar(']'),
+            ],
+            &OutputDestination::Stdout,
+            &mut syntax,
+        );
         assert_eq!(buffer.text(), "[0]");
         assert_eq!(state.cursor(), LineCol::new(0, 3));
         assert_eq!(closers, []);
@@ -810,29 +767,17 @@ mod tests {
 
     #[test]
     fn test_autopair_step_over_after_backspace_inside() {
-        let mut buffer = TextBuffer::from_text("");
-        let mut state = EditorState::new();
-        let dest = OutputDestination::Stdout;
         let mut syntax = None;
-        let mut closers = Vec::new();
-
-        for action in [
-            Action::InsertChar('['),
-            Action::InsertChar('a'),
-            Action::DeleteBackward,
-            Action::InsertChar(']'),
-        ] {
-            handle_action(
-                action,
-                &mut buffer,
-                &mut state,
-                &dest,
-                &mut syntax,
-                &mut closers,
-            )
-            .unwrap();
-        }
-
+        let (buffer, state, closers) = run_actions(
+            &[
+                Action::InsertChar('['),
+                Action::InsertChar('a'),
+                Action::DeleteBackward,
+                Action::InsertChar(']'),
+            ],
+            &OutputDestination::Stdout,
+            &mut syntax,
+        );
         assert_eq!(buffer.text(), "[]");
         assert_eq!(state.cursor(), LineCol::new(0, 2));
         assert_eq!(closers, []);

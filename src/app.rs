@@ -1,0 +1,819 @@
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use karet_core::{Decoration, FoldRegions, Highlights, LineCol};
+use karet_editor::{Editor, EditorState, Fold, resolve_folds};
+use karet_filetype::file_type_for_path;
+use karet_syntax::fold_by_indent;
+use karet_text::TextBuffer;
+use karet_theme::Theme;
+use karet_treesitter::{LanguageId, language_id_from_injection_name, language_id_from_path};
+use ratatui::layout::{Position, Rect};
+
+use crate::args::{CliArgs, OutputDestination};
+use crate::editing::handle_action;
+use crate::keymap::{Action, EditorMode, map_key};
+use crate::mouse::{
+    ClickTracker, EditorDrag, MouseContext, handle_drag_autoscroll, handle_mouse_event,
+};
+use crate::query::parse_inputs;
+use crate::query_ui::run_query_loop;
+use crate::search::SearchState;
+use crate::status_bar::{StatusBar, StatusBarConfig};
+use crate::syntax::SyntaxState;
+use crate::terminal::{TerminalGuard, split_viewport};
+
+pub enum EditorOutcome {
+    AcceptStdout(TextBuffer),
+    Exit(ExitCode),
+}
+
+pub struct App {
+    cli_args: CliArgs,
+}
+
+impl App {
+    pub const fn new(cli_args: CliArgs) -> Self {
+        Self { cli_args }
+    }
+
+    pub fn run(self) -> anyhow::Result<EditorOutcome> {
+        if self.cli_args.mode == EditorMode::Query {
+            let (raw_bytes, file_name, path_opt) = init_raw_input(&self.cli_args.destination)?;
+            let (inputs, fmt) = parse_inputs(
+                &raw_bytes,
+                path_opt.as_deref(),
+                self.cli_args.format.as_deref(),
+            )?;
+            let mut guard = TerminalGuard::init(12)?;
+            let outcome = run_query_loop(&mut guard, &self.cli_args, &inputs, fmt, &file_name)?;
+            drop(guard);
+            Ok(outcome)
+        } else {
+            let (buffer, file_name) =
+                init_buffer(&self.cli_args.destination, self.cli_args.mode)?;
+            let mut guard = TerminalGuard::init(10)?;
+            let outcome = run_editor_loop(&mut guard, &self.cli_args, buffer, &file_name)?;
+            drop(guard);
+            Ok(outcome)
+        }
+    }
+}
+
+fn save_buffer(buffer: &mut TextBuffer, path: &Path) -> anyhow::Result<()> {
+    let result = if path.exists() {
+        buffer.save(path)
+    } else {
+        buffer.save_new(path)
+    };
+    result.map(|_| ()).map_err(|err| match err {
+        karet_text::TextError::Conflict => {
+            anyhow::anyhow!(
+                "conflict: file was modified externally on disk: {}",
+                path.display()
+            )
+        }
+        other => anyhow::anyhow!("{other}"),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LoopControl {
+    Continue { text_changed: bool },
+    Exit(ExitCode),
+    AcceptStdout,
+}
+
+fn handle_search_key(
+    key: KeyEvent,
+    buffer: &TextBuffer,
+    state: &mut EditorState,
+    search: &mut SearchState,
+) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match key.code {
+        KeyCode::Esc => {
+            search.close();
+            search.query.clear();
+            search.matches.clear();
+            search.current = None;
+        }
+        KeyCode::Enter => {
+            search.close();
+        }
+        KeyCode::Down => {
+            if let Some(range) = search.next() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Up => {
+            if let Some(range) = search.prev() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Char('n') if ctrl => {
+            if let Some(range) = search.next() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Char('p') if ctrl => {
+            if let Some(range) = search.prev() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Backspace => {
+            search.query.pop();
+            search.update_matches(buffer, state.scroll_line());
+            if let Some(range) = search.current_range() {
+                state.center_on(range.start.line);
+            }
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            search.query.push(c);
+            search.update_matches(buffer, state.scroll_line());
+            if let Some(range) = search.current_range() {
+                state.center_on(range.start.line);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct KeyContext<'a> {
+    in_confirm_discard: &'a mut bool,
+    cli_args: &'a CliArgs,
+    buffer: &'a mut TextBuffer,
+    state: &'a mut EditorState,
+    syntax_state: &'a mut Option<SyntaxState>,
+    auto_closers: &'a mut Vec<LineCol>,
+    search: &'a mut SearchState,
+}
+
+fn handle_key_press(key: KeyEvent, ctx: &mut KeyContext<'_>) -> anyhow::Result<LoopControl> {
+    if *ctx.in_confirm_discard {
+        return Ok(match key.code {
+            KeyCode::Char('y' | 'Y') => LoopControl::Exit(ExitCode::from(1)),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                *ctx.in_confirm_discard = false;
+                LoopControl::Continue {
+                    text_changed: false,
+                }
+            }
+            _ => LoopControl::Continue {
+                text_changed: false,
+            },
+        });
+    }
+
+    if ctx.search.active {
+        handle_search_key(key, ctx.buffer, ctx.state, ctx.search);
+        return Ok(LoopControl::Continue {
+            text_changed: false,
+        });
+    }
+
+    let action = map_key(key, ctx.cli_args.mode);
+    match action {
+        Action::Abort => {
+            if ctx.buffer.is_dirty() {
+                *ctx.in_confirm_discard = true;
+                Ok(LoopControl::Continue {
+                    text_changed: false,
+                })
+            } else {
+                Ok(LoopControl::Exit(ExitCode::from(1)))
+            }
+        }
+        Action::Quit => {
+            if ctx.buffer.is_dirty() {
+                *ctx.in_confirm_discard = true;
+                Ok(LoopControl::Continue {
+                    text_changed: false,
+                })
+            } else {
+                Ok(LoopControl::Exit(ExitCode::SUCCESS))
+            }
+        }
+        Action::Save => {
+            if let OutputDestination::File(path) = &ctx.cli_args.destination {
+                save_buffer(ctx.buffer, path)?;
+            }
+            Ok(LoopControl::Continue {
+                text_changed: false,
+            })
+        }
+        Action::SaveAndAccept => match &ctx.cli_args.destination {
+            OutputDestination::File(path) => {
+                save_buffer(ctx.buffer, path)?;
+                Ok(LoopControl::Exit(ExitCode::SUCCESS))
+            }
+            OutputDestination::Stdout => Ok(LoopControl::AcceptStdout),
+        },
+        Action::StartSearch
+        | Action::SearchNext
+        | Action::SearchPrev
+        | Action::ScrollUp(_)
+        | Action::ScrollDown(_) => {
+            handle_view_or_search_action(action, ctx.buffer, ctx.state, ctx.search);
+            Ok(LoopControl::Continue {
+                text_changed: false,
+            })
+        }
+        Action::PageDown { .. }
+        | Action::PageUp { .. }
+        | Action::MoveDocStart { .. }
+        | Action::MoveDocEnd { .. }
+            if ctx.cli_args.mode == EditorMode::View =>
+        {
+            handle_view_or_search_action(action, ctx.buffer, ctx.state, ctx.search);
+            Ok(LoopControl::Continue {
+                text_changed: false,
+            })
+        }
+        other => {
+            let changed = handle_action(
+                other,
+                ctx.buffer,
+                ctx.state,
+                &ctx.cli_args.destination,
+                ctx.syntax_state,
+                ctx.auto_closers,
+            )?;
+            Ok(LoopControl::Continue {
+                text_changed: changed,
+            })
+        }
+    }
+}
+
+pub fn handle_view_or_search_action(
+    action: Action,
+    buffer: &TextBuffer,
+    state: &mut EditorState,
+    search: &mut SearchState,
+) {
+    match action {
+        Action::StartSearch => search.open(),
+        Action::SearchNext => {
+            if let Some(range) = search.next() {
+                state.center_on(range.start.line);
+            }
+        }
+        Action::SearchPrev => {
+            if let Some(range) = search.prev() {
+                state.center_on(range.start.line);
+            }
+        }
+        Action::ScrollUp(n) => state.scroll_to_line(state.scroll_line().saturating_sub(n)),
+        Action::ScrollDown(n) => state.scroll_to_line(state.scroll_line().saturating_add(n)),
+        Action::PageDown { .. } => state.scroll_page_down(),
+        Action::PageUp { .. } => state.scroll_page_up(),
+        Action::MoveDocStart { .. } => state.scroll_to_line(0),
+        Action::MoveDocEnd { .. } => {
+            let last_line = u32::try_from(buffer.line_count().saturating_sub(1)).unwrap_or(u32::MAX);
+            state.center_on(last_line);
+        }
+        _ => {}
+    }
+}
+
+pub struct RenderContext<'a> {
+    pub buffer: &'a TextBuffer,
+    pub theme: &'a Theme,
+    pub resolved_folds: &'a [Fold],
+    pub highlights: Option<&'a Highlights>,
+    pub decorations: &'a [Decoration],
+    pub lang_name: &'a str,
+    pub file_name: &'a str,
+    pub mode: EditorMode,
+    pub in_confirm_discard: bool,
+    pub search: &'a SearchState,
+}
+
+pub fn render_editor(
+    frame: &mut ratatui::Frame,
+    ctx: &RenderContext<'_>,
+    state: &mut EditorState,
+) -> (Rect, Rect) {
+    let area = frame.area();
+    let (top, bottom) = split_viewport(area);
+
+    let mut editor_widget = Editor::new(ctx.buffer)
+        .theme(ctx.theme)
+        .folds(ctx.resolved_folds)
+        .decorations(ctx.decorations)
+        .read_only(ctx.mode == EditorMode::View)
+        .word_wrap(true)
+        .focused(true);
+    if let Some(h) = ctx.highlights {
+        editor_widget = editor_widget.highlights(h);
+    }
+
+    frame.render_stateful_widget(editor_widget, top, state);
+
+    let total_lines = ctx.buffer.line_count();
+    let bottom_line = (state.scroll_line() as usize).saturating_add(top.height as usize);
+    let lines_below = total_lines.saturating_sub(bottom_line);
+    let pct_below = (lines_below * 100)
+        .checked_div(total_lines)
+        .and_then(|pct| u8::try_from(pct).ok())
+        .unwrap_or(0);
+
+    let status_config = StatusBarConfig {
+        cursor: state.cursor(),
+        selection: state.selection_range(),
+        language: ctx.lang_name,
+        file_name: ctx.file_name,
+        is_dirty: ctx.buffer.is_dirty(),
+        mode: ctx.mode,
+        in_confirm_discard: ctx.in_confirm_discard,
+        pct_below,
+        search: Some(ctx.search),
+        query_focus: None,
+        query_error: None,
+    };
+    StatusBar::new(ctx.theme, &status_config).draw(frame, bottom);
+
+    if ctx.search.active {
+        let query_len = u16::try_from(ctx.search.query.chars().count()).unwrap_or(u16::MAX);
+        let max_x = bottom.right().saturating_sub(1);
+        let cursor_x = bottom.x.saturating_add(1).saturating_add(query_len).min(max_x);
+        frame.set_cursor_position(Position::new(cursor_x, bottom.y));
+    } else if ctx.mode != EditorMode::View
+        && let Some((x, y)) = state.primary_caret_cell(top, ctx.buffer, ctx.resolved_folds)
+    {
+        frame.set_cursor_position(Position::new(x, y));
+    }
+
+    (area, top)
+}
+
+fn init_raw_input(
+    destination: &OutputDestination,
+) -> anyhow::Result<(Vec<u8>, String, Option<PathBuf>)> {
+    match destination {
+        OutputDestination::File(path) => {
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unnamed")
+                .to_owned();
+            let bytes =
+                std::fs::read(path).map_err(|e| anyhow::anyhow!("failed to read file: {e}"))?;
+            Ok((bytes, name, Some(path.clone())))
+        }
+        OutputDestination::Stdout => {
+            use std::io::{IsTerminal as _, Read as _};
+
+            if std::io::stdin().is_terminal() {
+                anyhow::bail!("no file specified and stdin is a terminal.");
+            }
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input)?;
+            Ok((input, "[stdin]".to_owned(), None))
+        }
+    }
+}
+
+fn init_buffer(
+    destination: &OutputDestination,
+    mode: EditorMode,
+) -> anyhow::Result<(TextBuffer, String)> {
+    match destination {
+        OutputDestination::File(path) => {
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unnamed")
+                .to_owned();
+
+            let buf = if path.exists() {
+                TextBuffer::load(path).map_err(|e| anyhow::anyhow!("failed to read file: {e}"))?
+            } else {
+                TextBuffer::from_text("")
+            };
+            Ok((buf, name))
+        }
+        OutputDestination::Stdout => {
+            use std::io::IsTerminal as _;
+
+            if std::io::stdin().is_terminal() {
+                if mode == EditorMode::View {
+                    anyhow::bail!("no file specified and stdin is a terminal.");
+                }
+                Ok((TextBuffer::from_text(""), "[prompt]".to_owned()))
+            } else {
+                use std::io::Read as _;
+
+                let mut input = Vec::new();
+                std::io::stdin().read_to_end(&mut input)?;
+                let buf = TextBuffer::from_bytes(&input)
+                    .map_err(|e| anyhow::anyhow!("stdin error: {e}"))?;
+                Ok((buf, "[stdin]".to_owned()))
+            }
+        }
+    }
+}
+
+fn resolve_language(cli_args: &CliArgs) -> (Option<LanguageId>, &'static str) {
+    if let Some(lang) = cli_args.language.as_deref() {
+        let dummy = PathBuf::from(format!("file.{lang}"));
+        let lang_id =
+            language_id_from_injection_name(lang).or_else(|| language_id_from_path(&dummy));
+        let ft = file_type_for_path(&dummy);
+        let lang_name = if ft.is_recognized() {
+            ft.name()
+        } else {
+            "Plain Text"
+        };
+        return (lang_id, lang_name);
+    }
+    match &cli_args.destination {
+        OutputDestination::File(path) => {
+            (language_id_from_path(path), file_type_for_path(path).name())
+        }
+        OutputDestination::Stdout => (None, "Plain Text"),
+    }
+}
+
+fn run_editor_loop(
+    guard: &mut TerminalGuard,
+    cli_args: &CliArgs,
+    mut buffer: TextBuffer,
+    file_name: &str,
+) -> anyhow::Result<EditorOutcome> {
+    let (lang_id, lang_name) = resolve_language(cli_args);
+    let mut syntax_state = lang_id.map(|lang| SyntaxState::new(lang, &buffer.text()));
+    let mut plain_folds = if syntax_state.is_none() {
+        fold_by_indent(&buffer.text(), 4)
+    } else {
+        FoldRegions::default()
+    };
+
+    let mut state = EditorState::new();
+    let theme = Theme::dark();
+
+    let mut folded: BTreeSet<u32> = BTreeSet::new();
+    let mut viewport_area = Rect::default();
+    let mut editor_area = Rect::default();
+    let mut in_confirm_discard = false;
+    let mut auto_closers: Vec<LineCol> = Vec::new();
+    let mut click_tracker = ClickTracker::default();
+    let mut editor_drag: Option<EditorDrag> = None;
+    let mut search = SearchState::default();
+
+    loop {
+        let folds = syntax_state.as_ref().map_or(&plain_folds, |syn| &syn.folds);
+        let resolved_folds = resolve_folds(folds, &folded);
+        let search_decorations = search.decorations();
+
+        let render_ctx = RenderContext {
+            buffer: &buffer,
+            theme: &theme,
+            resolved_folds: &resolved_folds,
+            highlights: syntax_state
+                .as_ref()
+                .and_then(|syn| syn.rendered_highlights.as_ref()),
+            decorations: &search_decorations,
+            lang_name,
+            file_name,
+            mode: cli_args.mode,
+            in_confirm_discard,
+            search: &search,
+        };
+
+        guard.terminal_mut().draw(|frame| {
+            let (view_area, ed_area) = render_editor(frame, &render_ctx, &mut state);
+            viewport_area = view_area;
+            editor_area = ed_area;
+        })?;
+        guard.set_viewport_area(viewport_area);
+
+        if event::poll(std::time::Duration::from_millis(50))? {
+            let mut text_changed = false;
+
+            match event::read()? {
+                Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+                    click_tracker.reset();
+                    editor_drag = None;
+                    let mut key_ctx = KeyContext {
+                        in_confirm_discard: &mut in_confirm_discard,
+                        cli_args,
+                        buffer: &mut buffer,
+                        state: &mut state,
+                        syntax_state: &mut syntax_state,
+                        auto_closers: &mut auto_closers,
+                        search: &mut search,
+                    };
+                    match handle_key_press(key, &mut key_ctx)? {
+                        LoopControl::Continue {
+                            text_changed: changed,
+                        } => {
+                            text_changed = changed;
+                        }
+                        LoopControl::Exit(code) => return Ok(EditorOutcome::Exit(code)),
+                        LoopControl::AcceptStdout => {
+                            return Ok(EditorOutcome::AcceptStdout(buffer));
+                        }
+                    }
+                }
+                Event::Mouse(mouse) if !in_confirm_discard => {
+                    let mut ctx = MouseContext {
+                        editor_area,
+                        folds,
+                        resolved_folds: &resolved_folds,
+                        folded: &mut folded,
+                        auto_closers: &mut auto_closers,
+                        click_tracker: &mut click_tracker,
+                        editor_drag: &mut editor_drag,
+                    };
+                    handle_mouse_event(mouse, &buffer, &mut state, &mut ctx);
+                }
+                _ => {}
+            }
+
+            if text_changed {
+                if let Some(ref mut syn) = syntax_state {
+                    syn.update(&buffer.text());
+                } else {
+                    plain_folds = fold_by_indent(&buffer.text(), 4);
+                }
+            }
+        } else if let Some(drag) = editor_drag {
+            handle_drag_autoscroll(drag, &mut state, &buffer, editor_area, &resolved_folds);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use karet_core::LineCol;
+    use karet_editor::editing;
+
+    use super::*;
+
+    #[test]
+    fn test_new_file_save_and_dirty_lifecycle() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!(
+            "qe_test_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let mut buffer = TextBuffer::from_text("");
+        assert!(!buffer.is_dirty());
+
+        let edit = editing::insert(LineCol::new(0, 0), None, buffer.version(), "hello world");
+        buffer.apply_simple(&edit.change).unwrap();
+        assert!(buffer.is_dirty());
+
+        buffer.save(&temp_file).unwrap();
+        assert!(!buffer.is_dirty());
+
+        let content = std::fs::read_to_string(&temp_file).unwrap();
+        assert_eq!(content.trim(), "hello world");
+
+        let _ = std::fs::remove_file(temp_file);
+    }
+
+    #[test]
+    fn test_handle_key_press_abort_and_confirm_discard_flow() {
+        let cli_args = CliArgs {
+            mode: EditorMode::Normal,
+            destination: OutputDestination::File(PathBuf::from("test.txt")),
+            language: None,
+            query: None,
+            format: None,
+        };
+        let mut buffer = TextBuffer::from_text("clean text");
+        let mut state = EditorState::new();
+        let mut in_confirm_discard = false;
+        let mut search = SearchState::default();
+
+        let mut key_ctx = KeyContext {
+            in_confirm_discard: &mut in_confirm_discard,
+            cli_args: &cli_args,
+            buffer: &mut buffer,
+            state: &mut state,
+            syntax_state: &mut None,
+            auto_closers: &mut Vec::new(),
+            search: &mut search,
+        };
+
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
+        assert!(!*key_ctx.in_confirm_discard);
+
+        let edit = editing::insert(LineCol::new(0, 0), None, key_ctx.buffer.version(), "dirty ");
+        key_ctx.buffer.apply_simple(&edit.change).unwrap();
+        assert!(key_ctx.buffer.is_dirty());
+
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(matches!(
+            res,
+            LoopControl::Continue {
+                text_changed: false
+            }
+        ));
+        assert!(*key_ctx.in_confirm_discard);
+
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(matches!(
+            res,
+            LoopControl::Continue {
+                text_changed: false
+            }
+        ));
+        assert!(!*key_ctx.in_confirm_discard);
+
+        handle_key_press(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(*key_ctx.in_confirm_discard);
+
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::from(1)));
+    }
+
+    #[test]
+    fn test_handle_key_press_prompt_mode_accept_file() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!(
+            "qe_prompt_test_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cli_args = CliArgs {
+            mode: EditorMode::Prompt,
+            destination: OutputDestination::File(temp_file.clone()),
+            language: None,
+            query: None,
+            format: None,
+        };
+        let mut buffer = TextBuffer::from_text("commit message");
+        let mut state = EditorState::new();
+        let mut in_confirm_discard = false;
+        let mut search = SearchState::default();
+
+        let mut key_ctx = KeyContext {
+            in_confirm_discard: &mut in_confirm_discard,
+            cli_args: &cli_args,
+            buffer: &mut buffer,
+            state: &mut state,
+            syntax_state: &mut None,
+            auto_closers: &mut Vec::new(),
+            search: &mut search,
+        };
+
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(matches!(res, LoopControl::Exit(code) if code == ExitCode::SUCCESS));
+        assert!(temp_file.exists());
+        let _ = std::fs::remove_file(temp_file);
+    }
+
+    #[test]
+    fn test_handle_key_press_prompt_mode_accept_stdout() {
+        let cli_args = CliArgs {
+            mode: EditorMode::Prompt,
+            destination: OutputDestination::Stdout,
+            language: None,
+            query: None,
+            format: None,
+        };
+        let mut buffer = TextBuffer::from_text("piped commit message");
+        let mut state = EditorState::new();
+        let mut in_confirm_discard = false;
+        let mut search = SearchState::default();
+
+        let mut key_ctx = KeyContext {
+            in_confirm_discard: &mut in_confirm_discard,
+            cli_args: &cli_args,
+            buffer: &mut buffer,
+            state: &mut state,
+            syntax_state: &mut None,
+            auto_closers: &mut Vec::new(),
+            search: &mut search,
+        };
+
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert_eq!(res, LoopControl::AcceptStdout);
+    }
+
+    #[test]
+    fn test_handle_key_press_view_mode_quit_and_search() {
+        let cli_args = CliArgs {
+            mode: EditorMode::View,
+            destination: OutputDestination::Stdout,
+            language: Some("rust".to_owned()),
+            query: None,
+            format: None,
+        };
+        let mut buffer = TextBuffer::from_text("fn main() {\n    println!(\"hi\");\n}\n");
+        let mut state = EditorState::new();
+        let mut in_confirm_discard = false;
+        let mut search = SearchState::default();
+        let mut syntax_state = None;
+        let mut auto_closers = Vec::new();
+        let mut key_ctx = KeyContext {
+            in_confirm_discard: &mut in_confirm_discard,
+            cli_args: &cli_args,
+            buffer: &mut buffer,
+            state: &mut state,
+            syntax_state: &mut syntax_state,
+            auto_closers: &mut auto_closers,
+            search: &mut search,
+        };
+
+        handle_key_press(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(key_ctx.search.active);
+
+        for ch in "main".chars() {
+            handle_key_press(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut key_ctx,
+            )
+            .unwrap();
+        }
+        assert_eq!(key_ctx.search.matches.len(), 1);
+
+        handle_key_press(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert!(!key_ctx.search.active);
+        assert_eq!(key_ctx.search.matches.len(), 1);
+
+        let res = handle_key_press(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut key_ctx,
+        )
+        .unwrap();
+        assert_eq!(res, LoopControl::Exit(ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn test_stdout_chunk_streaming_parity() {
+        let content = "line 1\nline 2 with some words\nline 3\n";
+        let buffer = TextBuffer::from_text(content);
+        let mut out = Vec::new();
+        for chunk in buffer.chunks() {
+            out.extend_from_slice(chunk.as_bytes());
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), content);
+    }
+
+    #[test]
+    fn test_from_bytes_bom_and_crlf_detection() {
+        let mut raw = vec![0xEF, 0xBB, 0xBF];
+        raw.extend_from_slice(b"first line\r\nsecond line\r\n");
+        let buffer = TextBuffer::from_bytes(&raw).unwrap();
+        assert_eq!(buffer.encoding(), karet_text::Encoding::Utf8Bom);
+        assert_eq!(buffer.eol(), karet_text::Eol::Crlf);
+        assert_eq!(buffer.line_count(), 3);
+        assert_eq!(buffer.line(0).unwrap(), "first line");
+        assert_eq!(buffer.line(1).unwrap(), "second line");
+
+        let invalid = [0xFF, 0xFE, 0xFD];
+        assert!(TextBuffer::from_bytes(&invalid).is_err());
+    }
+}
